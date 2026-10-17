@@ -11,7 +11,7 @@ Nothing here is theoretical. Every number was measured on the two boxes below.
 |---|---|---|
 | CPU | AMD Ryzen 7 9800X3D (8c/16t) | Apple M5 Max |
 | GPU | 2x RTX 5090, 62 GiB VRAM | 128 GiB unified memory |
-| Host RAM | 59 GiB | 128 GiB |
+| Host RAM | 62 GiB | 128 GiB |
 | OS | Linux | macOS |
 
 ## The problem, in one paragraph
