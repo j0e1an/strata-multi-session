@@ -62,6 +62,19 @@ class TestDetect(unittest.TestCase):
         self.assertGreater(box["vram_mib"], box["ram_mib"] // 10)
         self.assertLess(box["vram_mib"], box["ram_mib"] * 10)
 
+    def test_linux_ram_figures_are_the_two_meminfo_fields_exactly(self):
+        # The module's primary output, pinned to the field each one comes from. The +/-10x guard
+        # above is a units check and stays, but it cannot tell one field from another: 14282 sits
+        # between 1428 and 142820, so swapping the two returns in _mib_from_meminfo(), or matching
+        # MemFree (4096 MiB in this fixture) instead of MemAvailable, left every test green while
+        # apply-concurrency-fix.sh's --memory-limit-mib math sized itself from the wrong number.
+        box = detect.detect(run=TWO_5090, platform_name="linux")
+        self.assertEqual(box["ram_mib"], 59385)               # MemTotal 60810240 kB // 1024
+        self.assertEqual(box["memavail_mib"], 14282)          # MemAvailable 14625300 kB, floored
+        # 14625300/1024 is 14282.52, so the exact figure above also pins the floor rather than a
+        # round: apply-concurrency-fix.sh truncates with int() for the same reason, and the two
+        # entry points have to print the same MemAvailable.
+
     # --- the rest pins promises the interface makes that the three above leave untested ---
 
     def test_mac_without_a_memsize_reading_is_not_sized_on_zero(self):
