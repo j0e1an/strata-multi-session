@@ -21,15 +21,21 @@ working Python — the author's — so without the seam they ship untested:
   upstream's own (``setup.sh:9``): import ``venv`` **and** ``ensurepip``. Debian and Ubuntu
   ship ``venv`` without ``ensurepip`` — that is the separate ``python3-venv`` package — and a
   venv built without it has no pip, so importing ``venv`` alone waves through a box that fails
-  two steps later with a sudo prompt.
+  two steps later with a sudo prompt. The probe is aimed at whichever interpreter could actually
+  run the install, not only at ``python3``: a box whose system Python is broken can already have
+  a working ``.venv`` (see ``_python_check()``), and ``venv_python`` says which one answered.
 
-Units, because the key names are fixed by the plan and are not uniform: ``ram_mib`` and
-``memavail_mib`` are MiB, while ``vram_mib`` is whole GiB — it is ``vram_gib`` in
-``apply-concurrency-fix.sh``, and Tasks 3 and 7 compare it against the catalog's ``*_gb``
-columns. See ``_gpus_from_smi()`` for the one place the two entry points can differ by a GiB.
+Units: every ``*_mib`` field is real MiB, so the recommender can put two of them side by side.
+``vram_mib`` is ``nvidia-smi``'s per-card MiB summed as MiB — never converted to GiB — which on a
+2×5090 box is 65214 next to a ``ram_mib`` of ~60000, not 63 beside it. On macOS unified memory
+makes ``vram_mib == ram_mib``, still in MiB. Anything that wants GiB divides by 1024 itself.
+``apply-concurrency-fix.sh`` still prints a per-card-truncated GiB figure; that print is deferred,
+and ``_gpus_from_smi()`` is the one place the two entry points disagree by ~1 GiB because of it.
 
 ``run`` is the seam: a callable taking an argv list and returning stdout, ``""`` on failure.
-Nothing else in this module touches the filesystem or a subprocess.
+Nothing else in this module touches the filesystem or a subprocess — even the candidate venv
+interpreter is probed *through* ``run``, so a fixture path is the only path and a path that does
+not exist simply answers ``""``.
 """
 
 import os
@@ -42,7 +48,15 @@ from typing import Callable
 # reads the exit code; `run` carries stdout only, so the verdict has to be printed — a box that
 # fails either half prints nothing, and "" is what `run` returns for any failure anyway.
 PY_PROBE = "import sys, venv, ensurepip; print('ok' if sys.version_info >= (3, 10) else '')"
-PY_CMD = ["python3", "-c", PY_PROBE]
+
+# The fallback interpreter, in the order upstream's installer would use one of them: setup.sh
+# reuses an existing `.venv/bin/python` and only goes looking for a system `python3` when that is
+# missing, so the first candidate that passes is the one the install would actually run on. The
+# default location is the same one prepare-abliterated-pack.sh uses for STRATA_HOME.
+DEFAULT_STRATA_DIR = "~/Strata"
+VENV_PYTHON = os.path.join(".venv", "bin", "python")
+SYSTEM_PYTHON = "python3"
+PY_CMD = [SYSTEM_PYTHON, "-c", PY_PROBE]
 
 # The same two fields apply-concurrency-fix.sh reads, and the same kB -> MiB conversion (//1024).
 # awk narrows the file to the lines wanted; the parser still handles the raw file, so a fixture
@@ -90,13 +104,13 @@ def _mib_from_meminfo(text: str) -> tuple[int, int]:
 
 
 def _gpus_from_smi(text: str) -> tuple[list[str], int]:
-    """``([gpu names], total VRAM in whole GiB)`` from nvidia-smi's CSV; ``([], 0)`` on nothing.
+    """``([gpu names], total VRAM in MiB)`` from nvidia-smi's CSV; ``([], 0)`` on nothing.
 
-    The MiB figures are summed *before* the single GiB conversion. apply-concurrency-fix.sh
-    converts each card first, which truncates every one of them (32607 MiB -> 31 GiB), so a
-    2×5090 box reads 62 GiB there and 63 here. The summed figure is the honest one and the one
-    the plan's fixtures and Task 3's fit math use; the shell script is the one that should
-    change, not this.
+    The per-card figures arrive in MiB (``nounits``) and are summed *as MiB*, so the answer is
+    the same unit as ``ram_mib`` beside it and the two can be compared. apply-concurrency-fix.sh
+    converts each card to GiB first, which truncates every one of them (32607 MiB -> 31 GiB), so
+    a 2×5090 box prints 62 GiB there against 65214 MiB (63 GiB) here; that print is deferred and
+    is not this module's to fix.
     """
     names, mib = [], 0
     for line in text.strip().splitlines():
@@ -104,22 +118,53 @@ def _gpus_from_smi(text: str) -> tuple[list[str], int]:
         if len(parts) == 2 and parts[1].isdigit():
             names.append(parts[0])
             mib += int(parts[1])
-    return names, mib // 1024
+    return names, mib
+
+
+def _python_check(run: Callable[[list[str]], str],
+                  data_dir: str | None) -> tuple[bool, str | None]:
+    """``(python_ok, venv_python)`` — spec §13's pre-flight, from the first candidate that works.
+
+    "A Python 3.10+ that can make a venv with pip, somewhere this tool can actually use." Two
+    candidates get upstream's own probe (``setup.sh:9``), in the order ``setup.sh`` would use
+    them: the venv of an existing Strata install first — it is what the installer reuses, and on
+    a box like the author's (system ``python3`` 3.14 with no ``ensurepip``, ``python3 -m venv``
+    producing a venv with no pip) it is the *only* one that passes, so probing ``python3`` alone
+    fires §13's stop on every run of a box that already runs Strata. System ``python3`` second,
+    for the fresh box that has to create the venv.
+
+    The candidate path is probed through ``run``, never stat'd: a venv that isn't there answers
+    ``""`` the way a missing ``nvidia-smi`` does, so a fixture can describe either box. The
+    returned path is the interpreter that satisfied the probe — the venv path, or the bare
+    ``python3`` we invoked — so the caller can put its stop in the right place instead of
+    guessing which of the two it was; ``None`` when neither did.
+    """
+    root = os.path.expanduser(data_dir or DEFAULT_STRATA_DIR)
+    venv_py = os.path.join(root, VENV_PYTHON)
+    for interp, cmd in ((venv_py, [venv_py, "-c", PY_PROBE]),
+                        (SYSTEM_PYTHON, PY_CMD)):
+        if run(cmd).strip():
+            return True, interp
+    return False, None
 
 
 def detect(run: Callable[[list[str]], str] | None = None,
-           platform_name: str | None = None) -> dict:
+           platform_name: str | None = None,
+           data_dir: str | None = None) -> dict:
     """Describe this machine, the way the tier recommender needs it described.
 
     ``run`` defaults to :func:`default_run`; pass a fixture-answering callable to describe a
     box that isn't this one. ``platform_name`` defaults to ``sys.platform`` and, exactly as in
     apply-concurrency-fix.sh, anything that isn't ``darwin`` is treated as Linux — which is
     what this repo supports, so a Windows box goes down the Linux path rather than crashing.
+    ``data_dir`` is where the caller would put (or already has) the Strata install, so the
+    Python pre-flight looks for *its* ``.venv``; it defaults to ``~/Strata``.
 
     ``gpu_supported`` False is a stop, not a zero: the caller must not size a tier from the
     ``vram_mib`` it gets back, and ``gpu_note`` says what the tool does detect.
     """
     run = run or default_run
+    python_ok, venv_python = _python_check(run, data_dir)
     box = {
         "os": "darwin" if (platform_name or sys.platform) == "darwin" else "linux",
         "ram_mib": 0,
@@ -130,8 +175,11 @@ def detect(run: Callable[[list[str]], str] | None = None,
         "gpu_note": "",
         "cores": os.cpu_count() or 0,
         # spec §13: the one step that can need root, pre-checked so the caller can print the
-        # package command instead of inheriting a sudo prompt mid-install.
-        "python_ok": bool(run(PY_CMD).strip()),
+        # package command instead of inheriting a sudo prompt mid-install. venv_python names
+        # the interpreter that satisfied the check -- the existing .venv or system python3 --
+        # so the caller knows whether there is anything to install at all.
+        "python_ok": python_ok,
+        "venv_python": venv_python,
     }
 
     if box["os"] == "darwin":
