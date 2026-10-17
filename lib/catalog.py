@@ -14,9 +14,23 @@ source, named beside the row it came from:
                                                      family and shard count it leaves implicit are
                                                      its model_shard_names() defaults (metal/
                                                      setup_mac.py:74): family qwen, 2 shards
+  total_bytes                                        derived: the row's own shard_bytes summed
   MMPROJ                                             setup.py:423 (bytes + SHA-256) and setup.py:425
                                                      (the file name)
   CONTEXTS                                           setup.py:381, verbatim
+
+Two download figures live here, and they are not the same number on the four abliterated tiers.
+``download_gb`` is upstream's published figure, rounded to 0.1 GB, and it describes the file that
+row's family actually ships — except for Q2_0, IQ2_XS, IQ3_XXS and IQ3_S, where setup.py is quoting
+ISTA's censored file and SC117's re-quantization is 0.26-0.47 GB larger (Q2_0: 66.4 quoted,
+66,821,518,304 B = 66.82 GB real). ``total_bytes`` is the sum of the row's own ``shard_bytes``, so
+it is the size of the files this repo actually fetches; it is ``None`` where upstream pins no
+per-file sizes.
+
+**A disk check uses ``download_bytes()``, never ``download_gb``.** The preflight refuses a fetch
+before it starts, so a figure under the truth lets a user begin a download their disk cannot hold —
+and on the abliterated tiers ``download_gb`` is under the truth. ``download_gb`` stays exactly as
+upstream published it because the README and the plan quote that number.
 
 ``shard_bytes``/``shard_oids`` are empty where upstream pins no per-file hashes. IQ1_M: setup.py
 checks a pinned SHA-256 only for a family that carries a ``sha256`` table (setup.py:6486-6488), and
@@ -136,6 +150,12 @@ TIERS = {
     },
 }
 
+# total_bytes is derived, never typed: summing the row's own shard_bytes means the total cannot
+# drift from the shard list the way a second hardcoded figure can. None where upstream pins no
+# per-file sizes (IQ1_M, NVFP4) — no shards to add up, so no honest total.
+for _row in TIERS.values():
+    _row["total_bytes"] = sum(_row["shard_bytes"]) if _row["shard_bytes"] else None
+
 # The Mac's menu, and it is genuinely a smaller one: setup.py hands every darwin run to
 # metal/setup_mac.py, a different installer whose MAC_MODELS table omits IQ2_XS, the Coder IQ1_M,
 # NVFP4, UD-IQ4_XS and Q8_0. Recommending one of those to a Mac sends the user to an installer that
@@ -186,3 +206,26 @@ def shared_shard2() -> tuple[int, str]:
     (spec §16).
     """
     return (PLE_BYTES, PLE_OID)
+
+
+def download_bytes(tier: str) -> int | None:
+    """Bytes a disk preflight must see free before fetching ``tier`` — or None if we cannot say.
+
+    Use this, not ``download_gb``, before a download starts. The four abliterated tiers report
+    ``total_bytes``, the real size of SC117's files: their ``download_gb`` is upstream's censored
+    figure and sits 0.26-0.47 GB under what lands on disk, and a preflight built on it would wave
+    through a fetch the disk cannot hold. Every other tier reports upstream's ``download_gb`` in
+    bytes, which does describe the files that installer fetches (it is rounded to 0.1 GB, so it can
+    sit a few tens of MB either side of that row's shard total — noise next to the headroom a
+    preflight wants).
+
+    None rather than a guess, in two cases: a tier this catalog does not list at all, and an
+    abliterated tier whose shard sizes are not pinned — there the only figure on hand describes the
+    wrong file, so quoting it would be worse than saying nothing.
+    """
+    row = TIERS.get(tier)
+    if row is None:
+        return None
+    if row["abliterated"]:
+        return row.get("total_bytes")
+    return round(row["download_gb"] * 1_000_000_000)
