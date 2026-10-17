@@ -21,8 +21,8 @@ Units: two conversions, because upstream uses two
     **Disk and KV bytes are decimal GB.** ``catalog.download_bytes() / 1e9`` and the low-RAM mode's
     ``arena_gb + 1`` are what upstream compares against ``free_gb()`` =
     ``shutil.disk_usage().free / 1e9`` (setup.py:1596-1598, the preflight's ``need`` at
-    :6418-6420), and upstream's own KV rates are byte counts over ``1e9`` too (setup.py:4020
-    :4061). :func:`_disk_gb` and :func:`_kv_gb` stay decimal for that reason, and ``_reason``
+    :6418-6420), and upstream's own KV rates are byte counts over ``1e9`` too (setup.py:4022
+    :4059). :func:`_disk_gb` and :func:`_kv_gb` stay decimal for that reason, and ``_reason``
     prints GiB for RAM and VRAM and GB for the byte-derived figures.
 
     setup.py:292 and :297 are the proof that the two kinds of column are not the same unit: one
@@ -46,7 +46,14 @@ Two predicates, and the three-state verdict they both come from
     difference (``low_ram_fits``, setup.py:4039-4042) — and :func:`recommend` answers the same
     ladder for the tiers this tool will *name*, without the VRAM help. A tier inside the 8 GB band
     is labelled **tight** in the ``reason``, because "tight" is a materially different answer from
-    "fits"; it lives in the text, not in a key of its own (Task 7 prints a fixed shape).
+    "fits"; it lives in the text, not in a key of its own (Task 7 prints a fixed shape). The
+    ranking keeps the band ahead of the floor, which deviates from upstream's menu pre-selection
+    (setup.py:2247, ``fitting = [m for m in names if ram >= MODELS[m]["ram_gb"]]``, which selects
+    only among tiers that clear the floor and reports the tight ones without picking them): a 40.0
+    GiB box is offered IQ2_XS (floor 48, tight) over IQ1_M, which clears its 32 GiB floor, and a
+    52.0 GiB box IQ3_XXS (floor 60); preferring floor-clearing tiers first and falling back to the
+    band would hand the reference box IQ2_XS rather than IQ3_S, and the reference box is the only
+    machine this repo has measured — running IQ3_S with ``--resident-experts``.
 
 Stops, not zeros (spec §12)
     ``gpu_supported`` False, ``ram_mib`` 0 or ``vram_mib`` 0 returns no tier at all. A Linux box
@@ -65,7 +72,7 @@ Every number here names its source:
     what a card holds of the expert arena setup.py:4017-4023 (``low_ram_gpu_gb``), reproduced by
                                           :func:`_expert_cache_gb`; the engine stops with "no VRAM
                                           is left for the expert cache" when it reaches 0
-                                          (setup.py:5095-5097, :5139-5147)
+                                          (setup.py:5095-5097, :5148)
     the 50 % of the arena the card has to
     keep beside the KV, for a context to
     be worth recommending                 THIS TOOL'S OWN rule (``EXPERT_CACHE_MIN_SHARE``), not
@@ -82,7 +89,7 @@ Every number here names its source:
     the 8 GiB tight band                  setup.py:6092 (``"tight" if ram >= ram_gb - 8``), counted
                                           as fitting by setup.py:6111
     10 GB beside the experts              setup.py:3999 (``LOW_RAM_HEADROOM_GB``), the test at
-                                          setup.py:4011-4013 that decides the low-RAM mode applies
+                                          setup.py:4011-4014 that decides the low-RAM mode applies
     arena + 1 GB of extra disk            setup.py:6418-6420 (the disk preflight's ``need``)
     24 GB beside the model                setup.py:5210 (``AGENT_CACHE_FREE_GB``, bench #882 #440),
                                           upstream's own line for "this box has room for a
@@ -147,7 +154,7 @@ KV_BASELINE_CTX = 32_768
 # share to step the ladder down to, and this is the one upstream has published for the cache.
 EXPERT_CACHE_MIN_SHARE = 0.5
 
-# setup.py:3999 / :4011-4013: the RAM the experts need beside them, and the test that puts the
+# setup.py:3999 / :4011-4014: the RAM the experts need beside them, and the test that puts the
 # installer into the low-RAM mode when it is not there.
 LOW_RAM_HEADROOM_GB = 10
 
@@ -171,7 +178,6 @@ MEASURED_FAMILY = ("qwen",)
 NOT_MEASURED = (" (that rate is measured on qwen-family GSQ-RCO IQ3_S at 262144, not measured on "
                 "this tier)")
 
-MIB = 1_048_576
 GB = 1e9
 
 
@@ -210,8 +216,8 @@ def _kv_gb(context: int, kv: str) -> float:
     """GB of VRAM one conversation's KV cache takes at ``context`` tokens in format ``kv``.
 
     Decimal GB, because the figure is a byte count: upstream's own KV rates are bytes over ``1e9``
-    too (``kv_streaming_ram_gb``, setup.py:4056-4061, and the ``longer`` term of
-    ``low_ram_gpu_gb`` at :4020), and those are what the VRAM tests subtract from a GiB reading.
+    too (``kv_streaming_ram_gb``, setup.py:4056-4059, and the ``longer`` term of
+    ``low_ram_gpu_gb`` at :4022), and those are what the VRAM tests subtract from a GiB reading.
     """
     return context * _kv_bytes_per_token(kv) / GB
 
@@ -223,7 +229,7 @@ def _kv_room(vram_gib: float, tier: dict) -> float:
     The share is :data:`EXPERT_CACHE_MIN_SHARE`, this tool's own bar — see its comment. What
     upstream computes here is the other way round (the cache gets the remainder,
     ``low_ram_gpu_gb``, setup.py:4017-4023), and :func:`_expert_cache_gb` reproduces that. Like
-    upstream, this subtracts a decimal-GB arena from a GiB card (:4022 does the same).
+    upstream, this subtracts a decimal-GB arena from a GiB card (:4023 does the same).
     """
     return max(0.0, vram_gib - DENSE_WEIGHTS_GB) - EXPERT_CACHE_MIN_SHARE * tier["arena_gb"]
 
@@ -234,10 +240,10 @@ def _expert_cache_gb(vram_gib: float, tier: dict, context: int, kv: str) -> floa
     ``low_ram_gpu_gb`` (setup.py:4017-4023): the VRAM less ~5 GB of dense weights, buffers and a
     32K context, less the KV of a longer context, capped at the arena. When this reaches 0 the
     engine stops with "no VRAM is left for the expert cache" (setup.py:5095-5097, and the ~8 GB
-    card note at :5139-5147), so it is also the test for "does this card run at all".
+    card note at :5148), so it is also the test for "does this card run at all".
 
     Upstream models the longer-context KV at ``13 * cell_bytes`` B/token — 13,728 at int8
-    (setup.py:4020, and ``kv_streaming_ram_gb`` at :4061). This tool substitutes its own measured
+    (setup.py:4021, and ``kv_streaming_ram_gb`` at :4056-4059). This tool substitutes its own measured
     17,406 B/token instead. Measured beating modelled is fine, but they are two different figures:
     17,406 is a snapshot read off a running engine (spec §9), 13,728 is 13 layers times the
     engine's per-cell bytes. The measured rate is the larger, so the share reported here is the
@@ -256,7 +262,7 @@ def _kv_plan(vram_gib: float, tier: dict) -> tuple[int, str, bool, bool]:
     down — the order a user would trade them in, and the two flags Linux's ``relief`` names. Where
     no rung leaves the card :data:`EXPERT_CACHE_MIN_SHARE` of the arena, the answer is the floor of
     the ladder with ``meets_share`` False: the same direction upstream takes on a ~8 GB card, which
-    drops to 4-bit KV and a 4608 context before it gives the draft layer up (setup.py:5139-5147,
+    drops to 4-bit KV and a 4608 context before it gives the draft layer up (setup.py:5148,
     ``UD_FIT_CTX_STEPS``). Whether even that runs is upstream's question, not this tool's —
     ``runs_on_card`` is :func:`_expert_cache_gb` at the floor, and a card that holds no experts at
     all is the one case allowed to say the engine stops.
@@ -286,11 +292,11 @@ def _low_ram_fits(ram_gib: float, vram_gib: float, tier: dict) -> bool:
 def _low_ram_applies(ram_gib: float, tier: dict) -> bool:
     """Would the installer put this tier in the low-RAM mode on ``ram_gib`` GiB of RAM?
 
-    Upstream's own test (``low_ram_needed``, setup.py:4011-4013): the experts do not fit with the
+    Upstream's own test (``low_ram_needed``, setup.py:4011-4014): the experts do not fit with the
     usual ``LOW_RAM_HEADROOM_GB`` beside them, so they are mapped from the pack's ``experts.bin``
     instead of copied into RAM, and the mode writes an ``arena_gb + 1`` GB arena to disk
     (setup.py:6418-6420). The RAM here is GiB — upstream's unit for this comparison, and the arena
-    column is compared with it unconverted, exactly as at :4013. Unsloth's ``budget: True`` rows
+    column is compared with it unconverted, exactly as at :4014. Unsloth's ``budget: True`` rows
     are exempt (setup.py:4051): they read part of their experts from the GGUF through
     ``--resident-budget-gib`` whatever the RAM is, so no arena is written and the low-RAM mode is
     not what runs there.
@@ -470,7 +476,7 @@ def _reason(box: dict, name: str, context: int, kv: str, meets_share: bool, runs
                      f"costs {_kv_gb(context, kv):.1f} GB of KV at the measured "
                      f"{KV_BYTES_PER_TOKEN_INT8:,} bytes/token{measured}.")
     elif runs_on_card:
-        parts.append(f"The card is the tight side before the context is: at {context} tokens it "
+        parts.append(f"The card is the short side before the context is: at {context} tokens it "
                      f"holds {held:.1f} of the tier's {tier['arena_gb']} GB expert arena (the "
                      f"remainder after the dense weights and this context's KV, upstream's model at "
                      f"setup.py:4017-4023), short of the {EXPERT_CACHE_MIN_SHARE:.0%} this tool "
@@ -483,7 +489,7 @@ def _reason(box: dict, name: str, context: int, kv: str, meets_share: bool, runs
                      f"{max(0.0, vram - DENSE_WEIGHTS_GB):.1f} GB, and even the shortest context on "
                      f"the ladder at the cheapest format leaves no room beside the expert cache — "
                      f"the engine stops with 'no VRAM is left for the expert cache' "
-                     f"(setup.py:5095-5097, :5139-5147), short by {-room:.1f} GB at the measured "
+                     f"(setup.py:5095-5097, :5148), short by {-room:.1f} GB at the measured "
                      f"{KV_BYTES_PER_TOKEN_INT8:,} bytes/token{measured}.")
     if low_ram:
         parts.append(f"Its experts do not fit that RAM with the {LOW_RAM_HEADROOM_GB} GB upstream "

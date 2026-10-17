@@ -3,16 +3,17 @@ import unittest
 from lib import catalog, recommend
 
 # The three boxes the plan pins, with every *_mib in real MiB (Task 2's units fix). BIG is the
-# reference box (2x RTX 5090 at 32607 MiB each, summed as MiB = 65214, beside 60240 MiB of RAM =
-# 58.83 GiB, which is 3.17 GiB under IQ3_S's 62 GiB floor and so *tight* — see the module docstring
-# in lib/recommend.py). SMALL is a 24 GB gaming box (24.0 GiB of RAM and a 24.0 GiB card), MAC is a
-# 128 GiB Apple Silicon box with unified memory.
-BIG = {"os": "linux", "ram_mib": 60240, "vram_mib": 65214, "gpu_supported": True, "cores": 16}
+# reference box exactly as detect() reads it on this machine (2x RTX 5090 at 32607 MiB each, summed
+# as MiB = 65214, beside 60484 MiB of RAM = MemTotal 61,935,996 kB = 59.07 GiB, which is 2.93 GiB
+# under IQ3_S's 62 GiB floor and so *tight* — see the module docstring in lib/recommend.py). SMALL
+# is a 24 GB gaming box (24.0 GiB of RAM and a 24.0 GiB card), MAC is a 128 GiB Apple Silicon box
+# with unified memory.
+BIG = {"os": "linux", "ram_mib": 60_484, "vram_mib": 65214, "gpu_supported": True, "cores": 16}
 SMALL = {"os": "linux", "ram_mib": 24576, "vram_mib": 24576, "gpu_supported": True, "cores": 8}
 MAC = {"os": "darwin", "ram_mib": 131072, "vram_mib": 131072, "gpu_supported": True, "cores": 16}
 
 # Boxes with room beside the experts: 72 GiB and 96 GiB of RAM are over IQ3_S's 62 GiB floor and
-# over arena_gb + the 10 GB upstream keeps beside it (50.3 + 10, setup.py:4011-4013), so no arena
+# over arena_gb + the 10 GB upstream keeps beside it (50.3 + 10, setup.py:4011-4014), so no arena
 # is written and the disk figure is the download alone. The reference box no longer qualifies.
 ROOMY = {**BIG, "ram_mib": 73_728}      # 72.0 GiB
 ROOMIER = {**BIG, "ram_mib": 98_304}    # 96.0 GiB, also over the 24 GB of room for a cache
@@ -81,15 +82,15 @@ class TestRecommend(unittest.TestCase):
     # --- the tight band, which is what the reference box actually is (setup.py:6092, :6111) ---
 
     def test_the_reference_box_is_tight_and_says_so_with_the_margin(self):
-        # 60240 MiB = 58.83 GiB against IQ3_S's 62 GiB floor: upstream's verdict is "tight", not
+        # 60484 MiB = 59.07 GiB against IQ3_S's 62 GiB floor: upstream's verdict is "tight", not
         # "fits", and the reason must not let a user read it as fits.
         r = recommend.recommend(BIG)
         self.assertIn("tight", r["reason"])
-        self.assertIn("3.2 GiB under the floor", r["reason"])   # 62 - 58.83, the margin named
+        self.assertIn("2.9 GiB under the floor", r["reason"])   # 62 - 59.07, the margin named
 
     def test_the_reference_box_runs_iq3_s_in_the_low_ram_mode(self):
         # reference/strata-iq3_s-abliterated.json carries --resident-experts, which upstream writes
-        # only from low_ram_resident (setup.py:6329 :6336-6337, emitted :6591). 58.83 GiB is under
+        # only from low_ram_resident (setup.py:6329 :6336-6337, emitted :6591). 59.07 GiB is under
         # arena_gb + 10 = 60.3, so the mode applies here, and the disk figure carries the arena.
         r = recommend.recommend(BIG)
         self.assertTrue(r["low_ram"])
@@ -155,7 +156,7 @@ class TestRecommend(unittest.TestCase):
 
     def test_low_ram_mode_adds_the_arena_to_the_disk_figure(self):
         # 31471 MiB = 30.73 GiB of RAM: inside IQ1_M's 32 GB floor by 1.27, and under arena_gb +
-        # the 10 GB upstream keeps beside the experts (setup.py:4011-4013), so the installer writes
+        # the 10 GB upstream keeps beside the experts (setup.py:4011-4014), so the installer writes
         # an arena to disk.
         r = recommend.recommend({**BIG, "ram_mib": 31_471})
         self.assertEqual(r["tier"], "IQ1_M")
@@ -165,7 +166,7 @@ class TestRecommend(unittest.TestCase):
                                + catalog.TIERS["IQ1_M"]["arena_gb"] + 1, places=1)
 
     def test_a_tier_that_fits_with_room_beside_the_experts_needs_no_arena(self):
-        # Re-pointed from BIG, which the corrected units put inside the low-RAM mode (58.83 GiB
+        # Re-pointed from BIG, which the corrected units put inside the low-RAM mode (59.07 GiB
         # against arena_gb + 10 = 60.3). 96.0 GiB is 35.7 GiB over the arena, so nothing is mapped.
         r = recommend.recommend(ROOMIER)
         self.assertFalse(r["low_ram"])
@@ -176,15 +177,41 @@ class TestRecommend(unittest.TestCase):
     def test_a_small_ram_box_with_a_big_card_fits_in_the_low_ram_mode(self):
         # 40960 MiB = 40.0 GiB of RAM against IQ3_S's 50.3 GB arena: on the RAM alone it is short,
         # but upstream's test is ram - 6 + max(0, vram - 5) >= arena, i.e. 40 - 6 + 19 = 53, and it
-        # prints "fits in the low-RAM mode" (:6104-6108). The old RAM-only test said False.
+        # prints "fits in the low-RAM mode" (:6103). The old RAM-only test said False.
         fits, low = recommend.fits({"os": "linux", "ram_mib": 40_960, "vram_mib": 24_576,
                                     "gpu_supported": True}, catalog.TIERS["IQ3_S"])
         self.assertTrue(fits)
         self.assertTrue(low)
 
+    def test_low_ram_fits_subtracts_the_6_gib_upstream_leaves_out_of_the_way(self):
+        # setup.py:4042, the literal in low_ram_fits: ram - 6 + max(0.0, vram_gb - 5) >= arena_gb.
+        # 34816 MiB = 34.00 GiB with a 24576 MiB (24.00 GiB) card: 34 - 6 + 19 = 47 < IQ3_S's 50.3
+        # GB arena, so upstream refuses. Drop the 6 and it is 34 + 19 = 53 >= 50.3, which answers
+        # True. The box is 28 GiB under IQ3_S's 62 GiB floor — well outside the 8 GiB tight band —
+        # so this branch alone decides fits(), and the 6 is the only thing keeping the answer False.
+        fits, low = recommend.fits({"os": "linux", "ram_mib": 34_816, "vram_mib": 24_576,
+                                    "gpu_supported": True}, catalog.TIERS["IQ3_S"])
+        self.assertFalse(fits)
+        self.assertTrue(low)                                # 34 < arena_gb + 10, so the mode applies
+
+    def test_low_ram_fits_clamps_a_card_under_the_dense_weights_at_zero(self):
+        # setup.py:4042: the card's side is max(0.0, vram_gb - 5), so a card smaller than the ~5 GB
+        # of dense weights contributes nothing rather than a negative. 30300 MiB = 29.59 GiB with a
+        # 4096 MiB (4.00 GiB) card: 29.59 - 6 + 0 = 23.59 >= IQ1_M's 23.4 GB arena, so it fits;
+        # without the clamp the card eats 1.0 GiB of the RAM the box does have (22.59 < 23.4).
+        # Pinned on _low_ram_fits() itself: fits() also takes the tight-band branch, and 29.59 GiB
+        # is inside IQ1_M's 32 GiB floor by less than the 8 GiB band, so fits() answers True whatever
+        # the card term does.
+        self.assertTrue(recommend._low_ram_fits(recommend._ram_gib(30_300),
+                                                recommend._vram_gib(4_096),
+                                                catalog.TIERS["IQ1_M"]))
+
     def test_a_bigger_ram_box_with_a_small_card_does_not_fit(self):
         # 50000 MiB = 48.83 GiB with a 6144 MiB (6.0 GiB) card: 48.83 - 6 + 1 = 43.83 < 50.3, so
-        # upstream refuses. The old decimal reading called this 52.4 GB of RAM and let it through.
+        # upstream refuses. What flipped this box from True to False was replacing the old
+        # `ram >= tier["arena_gb"]` branch with this reproduction of low_ram_fits — the branch
+        # counted the whole arena against the RAM and ignored that the card holds none of it. (The
+        # decimal reading alone would not: 52.43 - 6 + 1 = 47.43 is still under 50.3.)
         fits, low = recommend.fits({"os": "linux", "ram_mib": 50_000, "vram_mib": 6_144,
                                     "gpu_supported": True}, catalog.TIERS["IQ3_S"])
         self.assertFalse(fits)
@@ -207,7 +234,7 @@ class TestRecommend(unittest.TestCase):
     def test_a_24gb_card_holds_part_of_the_arena_and_runs(self):
         # Upstream's low_ram_gpu_gb (setup.py:4017-4023) gives a 24576 MiB card 24 - 5 = 19.0 GB of
         # the 50.3 GB arena, so the engine starts; only a card that holds nothing at all is the
-        # "no VRAM is left for the expert cache" stop (:5095-5097, :5139-5147).
+        # "no VRAM is left for the expert cache" stop (:5095-5097, :5148).
         r = recommend.recommend({"os": "linux", "ram_mib": 63_488, "vram_mib": 24_576,
                                  "gpu_supported": True, "cores": 8})
         self.assertEqual(r["tier"], "IQ3_S")
@@ -238,6 +265,19 @@ class TestRecommend(unittest.TestCase):
         r = recommend.recommend(MAC)
         self.assertEqual(r["ceiling"], "none")
         self.assertEqual(r["relief"], "")
+
+    def test_the_24_gb_of_room_beside_the_model_is_what_makes_ram_the_ceiling_on_linux(self):
+        # setup.py:5210 (AGENT_CACHE_FREE_GB). Before this, the only no-ceiling test used the MAC
+        # fixture, where _ceiling returns "none" on the darwin branch whatever the number is, so
+        # setting the constant to 0 or to 96 left the whole suite green. ROOMY is 72.0 GiB against
+        # IQ3_S's 62 GiB floor: 10.0 GiB beside the model, under the 24 GB, so RAM binds and the
+        # conversation-cache flags are the relief — 0 would report no ceiling at all. ROOMIER is 96.0
+        # GiB: 34.0 GiB beside, over it, so nothing binds — 96 would report a RAM ceiling here.
+        roomy = recommend.recommend(ROOMY)
+        self.assertEqual(roomy["ceiling"], "ram")
+        self.assertIn("--conversation-cache-mib", roomy["relief"])
+        self.assertIn("--conversation-cache-slots", roomy["relief"])
+        self.assertEqual(recommend.recommend(ROOMIER)["ceiling"], "none")
 
     def test_sessions_size_the_cache_not_the_tier(self):
         self.assertEqual(recommend.recommend(BIG, sessions=1)["tier"],
