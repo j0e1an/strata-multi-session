@@ -474,7 +474,8 @@ class TestSetup(unittest.TestCase):
                       "(carried over", folded)
         self.assertIn("4 sessions x 3 parked each (carried over", folded)
         self.assertIn("1.43 GiB on 2026-10-18 (carried over", folded)
-        self.assertIn("measured on this box, 8 threads: (carried over", folded)
+        self.assertIn("measured on the reference box (2x5090, 8 threads, 2026-10-17): (carried over",
+                      folded)
 
     def test_the_measured_family_carries_no_carry_over_caveat(self):
         # The other half: on the family the figures WERE measured on, the caveat must be absent,

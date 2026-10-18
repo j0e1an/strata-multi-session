@@ -15,12 +15,20 @@ What the pins are for, in the order they matter:
   other tier means saying so beside it. Task 7 fixed exactly this finding once; these tests are
   what stop the extraction from re-introducing it in the new place — including the direction nobody
   thinks to check, a caller that names no tier at all.
+* **A carried figure names the box it came from.** The curve is a reference-box measurement, so the
+  printed line says which box and which date; and every line ``explain`` returns, the label
+  included, has to fit the 94-column fill, because a line that does not gets broken by the terminal
+  instead of by this file.
+* **The Mac note says what the Mac installer does.** ``setup_mac.py`` hardcodes ``gpu: True`` *and*
+  ``max_tokens: 1024`` and offers no flag for either, so both values are pinned in the note and the
+  claim that it has "no token cap" is pinned absent.
 * **The curve is a Linux measurement.** spec §10 forbids quoting it on a Mac, so ``explain`` has two
   bodies and both directions are pinned.
 * **One copy, not two.** The extraction only counts as an extraction while the entry point holds no
   second copy of the table, so two tests read ``bootstrap.sh`` as text. ``tests/test_setup.py``
   already scans that file for the same kind of claim (its ``PER_SESSION_PARKS`` pin), so the
-  technique is the one this repo uses.
+  technique is the one this repo uses — and the same scan pins the cap in ``--help``, the one place
+  the shell still has to type it because the help runs before the plan exists.
 """
 import os
 import re
@@ -57,7 +65,12 @@ class TestVision(unittest.TestCase):
     def test_mac_keeps_the_gpu_encoder(self):
         v = vision.block(**dict(ARGS, os_name="darwin"))
         self.assertTrue(v["gpu"])
-        self.assertNotIn("max_tokens", v)      # setup_mac.py:677 hardcodes gpu True, no token cap
+        # setup_mac.py:677-678 hardcodes gpu: True *and* "max_tokens": 1024 in the block it writes,
+        # and the Mac's live config carries both. The brief's assertNotIn("max_tokens", v) rested on
+        # its own test comment ("no token cap"), not on spec §10 — upstream's source says otherwise,
+        # so the cap is pinned present. 1024 is a literal here on purpose: it is upstream's number,
+        # and if our Linux cap ever moves this has to fail and force the choice in the open.
+        self.assertEqual(v["max_tokens"], 1024)
 
     def test_cpu_encode_curve_is_not_quoted_on_a_mac(self):
         self.assertNotIn("148", vision.explain("darwin"))
@@ -70,8 +83,10 @@ class TestVision(unittest.TestCase):
         # config on disk today has the cap last.
         self.assertEqual(list(vision.block(**dict(ARGS, os_name="linux"))),
                          ["exe", "mmproj", "model", "gpu", "max_tokens"])
+        # The same five keys in the same order on a Mac: that is the order setup_mac.py:677-678
+        # writes them in, which is the whole reason the darwin branch exists.
         self.assertEqual(list(vision.block(**dict(ARGS, os_name="darwin"))),
-                         ["exe", "mmproj", "model", "gpu"])
+                         ["exe", "mmproj", "model", "gpu", "max_tokens"])
 
     def test_the_paths_go_in_as_given(self):
         # block() composes nothing: the caller owns the paths, this file owns the shape.
@@ -118,12 +133,12 @@ class TestVision(unittest.TestCase):
     # ------------------------------------------------- spec §14: the curve says where it was measured
 
     def test_the_curve_carries_the_caveat_off_the_measured_family(self):
-        text = " ".join(vision.explain("linux", CARRIED_TIER).split())
+        text = unfolded(vision.explain("linux", CARRIED_TIER))
         self.assertIn("not measured on this tier", text)
         # The caveat is recommend's own sentence, not a copy of it — a second literal here would
-        # drift the moment lib rewords it.
-        self.assertIn(recommend.carry_over_note(CARRIED_TIER),
-                      vision.explain("linux", CARRIED_TIER))
+        # drift the moment lib rewords it. Compared with the wrapping undone: the sentence is one
+        # paragraph with the label now, so it breaks across the fill like the rest of the prose.
+        self.assertIn(unfolded(recommend.carry_over_note(CARRIED_TIER)), text)
 
     def test_the_curve_carries_no_caveat_on_the_measured_family(self):
         # The other half: on the family it WAS measured on, the caveat is noise, and noise nobody
@@ -141,6 +156,21 @@ class TestVision(unittest.TestCase):
         self.assertNotIn("not measured on this tier", text)
         self.assertIn("setup_mac.py", text)
         self.assertIn(":677", text)            # the citation, not just the file name
+        # Both of the installer's hardcoded values, named. setup_mac.py:677-678 writes gpu: True and
+        # "max_tokens": 1024, and offers no flag for either (--vision is choices yes|no at :506, and
+        # there is no --vision-tokens) — so the note that told users "no token cap" was false, and a
+        # rewording that drops either value has to fail here rather than re-earn the same review.
+        self.assertIn("gpu: true", text)
+        self.assertIn("max_tokens: 1024", text)
+        self.assertNotIn("no token cap", text)
+
+    def test_the_mac_note_names_both_flags_the_installer_lacks(self):
+        # The two things a Mac reader can actually act on: there is no --vision cpu to pass, and no
+        # --vision-tokens to raise the cap with. Pinned as the strings a reader would grep for.
+        text = unfolded(vision.explain("darwin", CARRIED_TIER))
+        self.assertIn("--vision yes|no", text)
+        self.assertIn("--vision cpu", text)
+        self.assertIn("--vision-tokens", text)
 
     def test_the_linux_prose_keeps_its_source(self):
         # "1024 is the cap" is only an argument because mtmd says grounding needs that many tokens.
@@ -155,17 +185,36 @@ class TestVision(unittest.TestCase):
         self.assertEqual(len(vision.ENCODE_CURVE), 5)     # spec §10's five rows, none dropped
 
     def test_the_curve_is_labelled_as_a_measurement(self):
-        # The line above the numbers has to say what box and what thread count produced them.
+        # The line above the numbers has to say what box, what thread count and what date produced
+        # them. spec §10's "this box" meant the reference box to whoever ran it; printed verbatim on
+        # someone else's machine it credits that machine with a curve it never measured, so the box
+        # and the date are pinned in the line the user reads, not only in the module docstring.
         folded = " ".join(vision.explain("linux", MEASURED_TIER).split())
-        self.assertIn("measured on this box, 8 threads:", folded)
+        self.assertIn("measured on the reference box (2x5090, 8 threads, 2026-10-17):", folded)
+        self.assertNotIn("measured on this box", folded)
 
     def test_the_prose_fits_the_column_it_is_printed_in(self):
+        # No exemption. This loop used to `continue` past "encode cost:" — "one long label line, as
+        # the entry point printed it" — which left the one line that overflowed the 94-column fill
+        # invisible to the assertion, and the terminal broke the §14 caveat mid-sentence at whatever
+        # width it happened to be. The label is a paragraph like any other now, so it is checked.
         text = vision.explain("linux", CARRIED_TIER, indent=" " * 16)
-        for line in text.splitlines():
-            if "encode cost:" in line:
-                continue                      # one long label line, as the entry point printed it
+        lines = text.splitlines()
+        labelled = [line for line in lines if "encode cost:" in line]
+        self.assertEqual(len(labelled), 1, "the label line appears exactly once")
+        self.assertLessEqual(len(labelled[0]), 94,
+                             "the label line itself, not exempted: %r" % labelled[0])
+        for line in lines:
             self.assertTrue(line.startswith(" " * 16), repr(line))
             self.assertLessEqual(len(line), 94, repr(line))
+
+    def test_the_caveat_wraps_off_the_label_instead_of_riding_it(self):
+        # The label alone fits the column; recommend.NOT_MEASURED_FIGURE does not fit beside it, so
+        # spec §14's sentence has to continue on the lines below. If it ever rides the label again
+        # the label is one ~190-column line again, and this fails beside the test above.
+        lines = vision.explain("linux", CARRIED_TIER, indent=" " * 16).splitlines()
+        self.assertTrue(lines[0].startswith(" " * 16 + "encode cost:"), repr(lines[0]))
+        self.assertIn("not measured on this tier", "\n".join(lines[1:]))
 
     # ------------------------------------------------------------- one copy, in one file
 
@@ -188,6 +237,20 @@ class TestVision(unittest.TestCase):
         self.assertNotIn("--vision-tokens 1024", src)
         self.assertIn('--vision-tokens "$VISION_TOKENS"', src)
         self.assertIn('("vision_tokens", vision.VISION_MAX_TOKENS)', src)
+
+    def test_the_help_text_quotes_the_cap_lib_actually_writes(self):
+        """--help is the one place the cap still has to be typed, so it is pinned to the constant.
+
+        usage() prints a quoted heredoc: every other consumer reads VISION_TOKENS back from the
+        derived block, but the help text runs before the plan does, so there is nothing there to
+        read from. Deriving it would mean either an unquoted heredoc — which expands the
+        $STRATA_DATA and friends printed two lines above it — or a sed of lib/vision.py at help
+        time, which fails silently to "cpu at  image tokens" the moment the constant line is
+        reformatted. Pinning the sentence to vision.VISION_MAX_TOKENS gets the same guarantee
+        without either: move the cap and --help fails until the sentence is rewritten to match.
+        """
+        self.assertIn("Linux defaults to cpu at %d image tokens" % vision.VISION_MAX_TOKENS,
+                      unfolded(read(BOOTSTRAP)))
 
 
 if __name__ == "__main__":

@@ -15,15 +15,21 @@ Why the two OSes disagree, and where each figure came from
 
     **macOS: there is no CPU encoder to choose.** The Mac's ``strata-vision`` is built with ggml's
     Metal backend and encodes sub-second (measured on the Mac, which is why that sentence needs no
-    carry-over caveat), and ``metal/setup_mac.py`` offers only ``--vision yes|no`` while
-    hardcoding ``gpu: true`` in the block it writes (:677). So :func:`block` forces the encoder on
-    for darwin whatever was asked, and writes no ``max_tokens`` there: the cap is the Linux
-    measurement and that installer has no token cap to write.
+    carry-over caveat), and ``metal/setup_mac.py`` offers only ``--vision yes|no`` (:506) while
+    hardcoding *both* ``gpu: True`` and ``max_tokens: 1024`` in the block it writes (:677-678),
+    with no ``--vision-tokens`` to change either. So :func:`block` forces the encoder on for darwin
+    whatever was asked, and writes the cap there too: the rule is to mirror what that installer
+    writes, and what it writes has a cap in it.
 
     **The curve is a Linux measurement, quoted on Linux only.** spec §10 says the tool must not
     quote it on a Mac and must not promise a CPU encoder there, so :func:`explain` returns the
     Metal note on darwin and the table on every other OS — and the table's numbers never reach a
     Mac screen. ``tests/test_vision.py`` pins both directions.
+
+    **The printed line names the box the curve came from.** spec §10's "All measured 2026-10-17 on
+    this box" means the reference box — the 2x5090 every number in this repo comes from — not the
+    reader's machine. :data:`MEASURED_ON` says so in the line the user actually reads; a docstring
+    nobody opens is not a label.
 
     **The caveat travels with the table.** spec §14 lists the CPU encode curve among the four
     figures measured on qwen-family GSQ-RCO IQ3_S at 262144 with ``--kv int8``, so carrying it
@@ -47,9 +53,16 @@ from lib import recommend
 # sentence in :func:`explain` that justifies it quotes the same number.
 VISION_MAX_TOKENS = 1024
 
+# Where and when :data:`ENCODE_CURVE` was measured, in the words :func:`explain` prints. spec §10
+# says "this box", and on the box that ran it that reads fine; on the reader's box the same three
+# words credit a machine that never ran it with a curve it never measured. So the printed line names
+# the machine and the date instead of leaving "this" to be resolved by whoever is reading.
+MEASURED_ON = "the reference box (2x5090, 8 threads, 2026-10-17)"
+
 # spec §10's table, verbatim: image tokens -> wall-clock seconds for one CPU encode on 8 threads,
-# measured 2026-10-17 on the reference box (the 2x5090 every number in this repo comes from). The
-# last row is the uncapped run. The seconds are strings, not floats, because that is the precision
+# measured 2026-10-17 on the reference box (the 2x5090 every number in this repo comes from — the
+# same box and date :data:`MEASURED_ON` prints). The last row is the uncapped run. The seconds are
+# strings, not floats, because that is the precision
 # they were measured at — reformatting 5.9 through "%.2f" would print a decimal place nobody
 # observed, and the plan quotes these readings rather than computing from them.
 ENCODE_CURVE = ((300, "1.29 s"), (768, "5.9 s"), (972, "8.7 s"), (2028, "31.8 s"),
@@ -61,11 +74,15 @@ ENCODE_CURVE = ((300, "1.29 s"), (768, "5.9 s"), (972, "8.7 s"), (2028, "31.8 s"
 # with the whole block.
 PROSE_WIDTH = 78
 
-# spec §10's Mac note, and the reason explain() has two bodies.
+# spec §10's Mac note, and the reason explain() has two bodies. Both hardcoded values are quoted
+# because both are what the installer writes: --vision is choices=["yes","no"] at :506, there is no
+# --vision-tokens, and the block at :677-678 carries gpu: True *and* max_tokens: 1024. Saying "no
+# token cap" here would be the sentence this file got wrong once already.
 _MAC_NOTE = ("the CPU encode curve is a Linux measurement and does not apply: the Mac's "
              "strata-vision is built with ggml's Metal backend and encodes sub-second, and "
-             "setup_mac.py offers only --vision yes|no while hardcoding gpu: true (:677). No "
-             "--vision cpu, no token cap, on this installer.")
+             "setup_mac.py offers only --vision yes|no (:506) while hardcoding gpu: true and "
+             "max_tokens: 1024 in the block it writes (:677-678). No --vision cpu, and no "
+             "--vision-tokens to change either of them with.")
 
 _LINUX_CURVE_NOTE = ("superlinear — 2.56x the tokens cost 4.6x the time, so a linear guess from "
                      "\"3 s at 300 tokens\" is wrong. mtmd warns that Qwen-VL needs at least %d "
@@ -87,23 +104,24 @@ def block(exe: str, mmproj: str, model: str, os_name: str, gpu: bool = False) ->
     """The ``vision`` section ``serve/server.py`` reads, in the shape the OS's installer writes.
 
     Key order is part of the contract, not an accident: the apply path dumps this dict straight
-    into the config file, and today's written config is ``exe, mmproj, model, gpu`` then
-    ``max_tokens`` on the non-darwin path only. ``tests/test_vision.py`` pins the order so a
-    refactor cannot reshuffle the file.
+    into the config file, and both installers' blocks are ``exe, mmproj, model, gpu`` then
+    ``max_tokens``. ``tests/test_vision.py`` pins the order so a refactor cannot reshuffle the file.
 
     ``gpu`` is what was asked for — ``--vision gpu`` on Linux. It is forced on for macOS whatever
-    was asked, because ``metal/setup_mac.py:677`` hardcodes ``gpu: true`` and the Mac build has no
+    was asked, because ``metal/setup_mac.py:677`` hardcodes ``gpu: True`` and the Mac build has no
     CPU encoder to name: a ``gpu: false`` there would be a promise the binary cannot keep.
 
-    ``max_tokens`` is written on every non-darwin OS and on no darwin one. The cap is the Linux
-    measurement in :data:`ENCODE_CURVE`, and ``setup_mac.py`` has no token cap to write (spec §10).
-    ``server.py`` reads ``gpu: true`` as "add ``--vram-reserve-mib`` to the engine args"
-    (spec §10), which is the one behavioural difference between the two values.
+    ``max_tokens`` is written on every OS, in the same position. On Linux it is the cap
+    :data:`ENCODE_CURVE` justifies. On macOS it is not this tool's choice at all: the block
+    ``setup_mac.py`` writes carries ``"max_tokens": 1024`` on the line after the ``gpu: True``
+    (:677-678), and the Mac's live config has both, so omitting it here would diverge from the very
+    installer this branch exists to mirror. ``server.py`` reads ``gpu: true`` as "add
+    ``--vram-reserve-mib`` to the engine args" (spec §10), which is the one behavioural difference
+    between the two values.
     """
     section = {"exe": exe, "mmproj": mmproj, "model": model,
                "gpu": bool(gpu) or os_name == "darwin"}
-    if os_name != "darwin":
-        section["max_tokens"] = VISION_MAX_TOKENS
+    section["max_tokens"] = VISION_MAX_TOKENS
     return section
 
 
@@ -117,7 +135,9 @@ def explain(os_name: str, tier: str | None = None, indent: str = "") -> str:
     honest default for an unlabelled measurement is to label it.
 
     ``indent`` is the caller's prose column. Lines come back wrapped to ``len(indent) +``
-    :data:`PROSE_WIDTH`, so the entry point's 16-space column still fills to 94.
+    :data:`PROSE_WIDTH`, so the entry point's 16-space column still fills to 94 — including the
+    label line, which is a paragraph like any other: with the §14 caveat attached it runs well past
+    the fill, and a line the terminal has to break gets broken mid-sentence on the reader's screen.
 
     The curve is a Linux measurement (spec §10), so on darwin it is not quoted at all and no
     caveat is needed: nothing measured on another tier is being carried onto this one.
@@ -125,11 +145,11 @@ def explain(os_name: str, tier: str | None = None, indent: str = "") -> str:
     if os_name == "darwin":
         return _wrap(_MAC_NOTE, indent)
     caveat = recommend.NOT_MEASURED_FIGURE if tier is None else recommend.carry_over_note(tier)
-    lines = ["encode cost: measured on this box, 8 threads:%s" % caveat]
-    lines += ["%5d image tokens -> %s" % (tokens, seconds) for tokens, seconds in ENCODE_CURVE]
-    lines.append(_LINUX_CURVE_NOTE)
-    return "\n".join(_wrap(line, indent) if i == len(lines) - 1
-                     else "%s%s" % (indent, line) for i, line in enumerate(lines))
+    label = "encode cost: measured on %s:%s" % (MEASURED_ON, caveat)
+    rows = ["%5d image tokens -> %s" % (tokens, seconds) for tokens, seconds in ENCODE_CURVE]
+    return "\n".join([_wrap(label, indent)]
+                     + ["%s%s" % (indent, row) for row in rows]
+                     + [_wrap(_LINUX_CURVE_NOTE, indent)])
 
 
 def _wrap(text: str, indent: str) -> str:

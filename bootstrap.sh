@@ -948,7 +948,8 @@ if vision_mode == "no":
     cfg.pop("vision", None)
 else:
     # lib/vision.block() owns the shape: gpu forced on for a Mac (metal/setup_mac.py:677 hardcodes
-    # it) and max_tokens written on the non-darwin path only (spec §10). Key order is its own.
+    # it) and max_tokens written on both paths, because setup_mac.py:678 hardcodes that too
+    # (spec §10). Key order is its own.
     cfg["vision"] = vision.block(exe=os.path.join(strata, "engine", "strata-vision"),
                                  mmproj=os.path.join(model_dir, catalog.MMPROJ["file"]),
                                  model=shard1, os_name=os_name,
