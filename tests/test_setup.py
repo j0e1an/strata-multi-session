@@ -160,7 +160,8 @@ class TestSetup(unittest.TestCase):
         os.makedirs(repo)
         for name in ("bootstrap.sh", "apply-concurrency-fix.sh"):
             shutil.copy(os.path.join(ROOT, name), repo)
-        for name in ("__init__.py", "catalog.py", "detect.py", "recommend.py", "autostart.py"):
+        for name in ("__init__.py", "catalog.py", "detect.py", "recommend.py", "autostart.py",
+                     "vision.py"):
             libdir = os.path.join(repo, "lib")
             os.makedirs(libdir, exist_ok=True)
             shutil.copy(os.path.join(ROOT, "lib", name), libdir)

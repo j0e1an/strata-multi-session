@@ -20,9 +20,11 @@
 # measured constant: it sequences, it refuses, and it runs the scripts that already do the work —
 # fetch-abliterated.sh and apply-concurrency-fix.sh as subprocesses, because spec §5 says call it,
 # do not fork it. What it still owns, precisely, is two measured READINGS quoted in prose rather
-# than computed — the CPU encode curve in the vision section and the dated parked-snapshot readings
-# in the sizing section — each naming its box and its date, and each carrying spec §14's
-# "not measured on this tier" caveat whenever the chosen tier is outside the qwen family.
+# than computed — the dated parked-snapshot readings in the sizing section and the CPU-encoder
+# decode reading beside the vision mode — each naming its box and its date, and the first carrying
+# spec §14's "not measured on this tier" caveat whenever the chosen tier is outside the qwen
+# family. The vision prose and the vision block are lib/vision.py's (spec §10), the CPU encode
+# curve with them and the caveat that travels with it.
 #
 # --apply is what writes or downloads. Without it the script prints the plan and changes nothing:
 # no directory is created, no file is written, no byte is fetched.
@@ -230,17 +232,21 @@ run_plan() {
     "$PY" - <<'PY'
 import os, sys, textwrap
 sys.path.insert(0, os.environ["BS_REPO"])
-from lib import autostart, catalog, detect, recommend
+from lib import autostart, catalog, detect, recommend, vision
 
 MIB = 1_048_576
 GB = 1e9
+
+# The plan's prose column: 16 spaces in, filled to 94. lib/vision.explain() fills its own block to
+# the same column, so it is handed this indent rather than guessing the layout.
+PROSE_INDENT = " " * 16
 
 
 def col(label, value=""):
     print("%-16s%s" % (label, value))
 
 
-def wrap(text, indent=" " * 16):
+def wrap(text, indent=PROSE_INDENT):
     return textwrap.fill(text, width=94, initial_indent=indent, subsequent_indent=indent)
 
 
@@ -255,7 +261,7 @@ upstream = os.path.expanduser(os.environ["BS_UPSTREAM"])
 sessions = int(os.environ["BS_SESSIONS"])
 want_abl = os.environ["BS_ABL"] == "1"
 tier_wanted = os.environ["BS_TIER"]
-vision = os.environ["BS_VISION"]
+vision_flag = os.environ["BS_VISION"]          # the raw --vision value, "" when it was absent
 port = int(os.environ["BS_PORT"])
 host = os.environ["BS_HOST"]
 router_port = int(os.environ["BS_ROUTER_PORT"])
@@ -598,27 +604,20 @@ else:
 print()
 
 # ------------------------------------------------------------------- vision (spec §10, by OS)
-vision_mode = vision or ("cpu" if os_name != "darwin" else "gpu")
+# The mode is the flag or this OS's default; the prose and the written block are lib/vision.py's,
+# so the encode curve and the cap it justifies exist in one place (spec §10, §14).
+vision_mode = vision_flag or vision.default_mode(os_name)
 print("vision")
 if os_name == "darwin":
     col("mode", "%s (Metal encoder)" % vision_mode)
-    print(wrap("the CPU encode curve below is a Linux measurement and does not apply: the Mac's "
-               "strata-vision is built with ggml's Metal backend and encodes sub-second, and "
-               "setup_mac.py offers only --vision yes|no while hardcoding gpu: true (:677). No "
-               "--vision cpu, no token cap, on this installer."))
+    print(vision.explain(os_name, tier, indent=PROSE_INDENT))
 else:
-    col("mode", "%s%s" % (vision_mode, " (default)" if not vision else " (--vision)"))
+    col("mode", "%s%s" % (vision_mode, " (default)" if not vision_flag else " (--vision)"))
     if vision_mode != "no":
         col("mmproj", "%s  %s bytes" % (catalog.MMPROJ["file"], catalog.MMPROJ["bytes"]))
         if vision_mode == "cpu":
-            col("max_tokens", "1024")
-            col("encode cost", "measured on this box, 8 threads:%s" % carry)
-            for tokens, seconds in ((300, "1.29 s"), (768, "5.9 s"), (972, "8.7 s"),
-                                    (2028, "31.8 s"), (4015, "148 s")):
-                col("", "%5d image tokens -> %s" % (tokens, seconds))
-            print(wrap("superlinear — 2.56x the tokens cost 4.6x the time, so a linear guess from "
-                       "\"3 s at 300 tokens\" is wrong. mtmd warns that Qwen-VL needs at least "
-                       "1024 image tokens for grounding, so 1024 is the cap this tool writes."))
+            col("max_tokens", "%d" % vision.VISION_MAX_TOKENS)
+            print(vision.explain(os_name, tier, indent=PROSE_INDENT))
         else:
             print(wrap("gpu: true makes server.py add --vram-reserve-mib to the engine args; the "
                        "CPU encoder costs text generation nothing measurable on this box "
@@ -666,6 +665,7 @@ for key, value in (("tier", tier), ("family", row["family"]), ("abliterated", 1 
                    ("low_ram", 1 if chosen["low_ram"] else 0), ("sessions", sessions),
                    ("snapshot_mib", snapshot_mib), ("budget_mib", budget_mib), ("slots", slots),
                    ("port", port), ("host", host), ("vision", vision_mode),
+                   ("vision_tokens", vision.VISION_MAX_TOKENS),
                    ("data_dir", data_dir), ("strata", strata), ("upstream", upstream),
                    ("model_dir", model_dir), ("pack_dir", pack_dir), ("stock_pack", stock_pack),
                    ("config", config), ("log", log_path), ("installed", 1 if installed else 0),
@@ -696,6 +696,7 @@ SESSIONS=$(get sessions)
 PORT=$(get port)
 HOST=$(get host)
 VISION_MODE=$(get vision)
+VISION_TOKENS=$(get vision_tokens)
 DATA_DIR=$(get data_dir)
 STRATA_HOME_DIR=$(get strata)
 UPSTREAM=$(get upstream)
@@ -742,8 +743,8 @@ upstream_argv() {
     set -- "$@" --kv "$KV"
     case "$VISION_MODE" in
       no)  set -- "$@" --vision no ;;
-      gpu) set -- "$@" --vision gpu --vision-tokens 1024 ;;
-      *)   set -- "$@" --vision cpu --vision-tokens 1024 ;;
+      gpu) set -- "$@" --vision gpu --vision-tokens "$VISION_TOKENS" ;;
+      *)   set -- "$@" --vision cpu --vision-tokens "$VISION_TOKENS" ;;
     esac
   else
     case "$VISION_MODE" in
@@ -793,7 +794,7 @@ say_stage "5 concurrency  $SCRIPT_DIR/apply-concurrency-fix.sh --sessions $SESSI
 say_stage "               (called as a subprocess; its math stays its own — spec §5)"
 say_stage "6 vision       $VISION_MODE"
 if [ "$OS" != darwin ] && [ "$VISION_MODE" = cpu ]; then
-  say_stage "               max_tokens 1024, gpu false"
+  say_stage "               max_tokens $VISION_TOKENS, gpu false"
 fi
 if [ "$AUTOSTART" = 1 ]; then
   say_stage "7 autostart    write $(get unit)"
@@ -875,7 +876,7 @@ if [ "$ABL" = 1 ]; then
         "$PY" - <<'PY'
 import json, os, sys
 sys.path.insert(0, os.environ["BS_REPO"])
-from lib import catalog
+from lib import catalog, vision
 
 os_name = os.environ["BS_OS"]
 strata = os.environ["BS_STRATA"]
@@ -886,7 +887,7 @@ model_dir = os.environ["BS_MODEL_DIR"]
 pack = os.environ["BS_PACK_DIR"]
 config = os.environ["BS_CONFIG"]
 low_ram = os.environ["BS_LOW_RAM"] == "1"
-vision = os.environ["BS_VISION"]
+vision_mode = os.environ["BS_VISION"]
 
 ref = os.path.join(os.environ["BS_REPO"], "reference", "strata-iq3_s-abliterated.json")
 with open(ref) as fh:
@@ -943,18 +944,15 @@ if kept:
 else:
     cfg.pop("lib_dirs", None)
 
-if vision == "no":
+if vision_mode == "no":
     cfg.pop("vision", None)
 else:
-    block = {"exe": os.path.join(strata, "engine", "strata-vision"),
-             "mmproj": os.path.join(model_dir, catalog.MMPROJ["file"]),
-             "model": shard1,
-             "gpu": vision == "gpu" or os_name == "darwin"}
-    if os_name != "darwin":
-        # setup_mac.py hardcodes gpu: true and has no token cap (spec §10); the 1024 cap is the
-        # Linux measurement.
-        block["max_tokens"] = 1024
-    cfg["vision"] = block
+    # lib/vision.block() owns the shape: gpu forced on for a Mac (metal/setup_mac.py:677 hardcodes
+    # it) and max_tokens written on the non-darwin path only (spec §10). Key order is its own.
+    cfg["vision"] = vision.block(exe=os.path.join(strata, "engine", "strata-vision"),
+                                 mmproj=os.path.join(model_dir, catalog.MMPROJ["file"]),
+                                 model=shard1, os_name=os_name,
+                                 gpu=vision_mode == "gpu")
 
 parent = os.path.dirname(config)
 if parent and not os.path.isdir(parent):
@@ -995,7 +993,7 @@ else
   echo "concurrency  skipped: no readable config at $CONFIG yet" >&2
 fi
 
-# 6. vision — written into the config above; nothing else to do until Task 8 owns lib/vision.py.
+# 6. vision — written into the config above by lib/vision.block(); nothing else to do here.
 echo "vision       $VISION_MODE in $CONFIG"
 
 # 7. autostart — render, write, then run the enable steps one at a time.
