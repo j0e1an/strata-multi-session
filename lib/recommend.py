@@ -605,19 +605,29 @@ def recommend(box: dict, sessions: int = 4, want_abliterated: bool = True) -> di
 # spec §9 is explicit that the tool has to tell the user to expect that second pass rather than
 # pretend the first one is final. Task 7 prints what these return.
 #
-# Two of them reproduce arithmetic that already ships, and the tests in tests/test_sizing.py check
-# them against the script's own text: Task 7 prints one source or the other, so a reader comparing
-# two answers about one engine must not see two numbers, or two names for the same number.
+# Two of them reproduce arithmetic that already ships: Task 7 prints one source or the other, so a
+# reader comparing two answers about one engine must not see two numbers, or two names for the same
+# number. What tests/test_sizing.py checks against the script's own text is the label, the fallback
+# figure and the two KV divergences; the arithmetic itself is pinned to literals copied from the
+# script's lines, so editing the script does not re-check the arithmetic on its own.
 
 # One MiB, spelled out because the script spells it the same way (apply-concurrency-fix.sh:191
 # :206) and the two files have to land on the same integer, including where they truncate.
 MIB = 1_048_576
 
 # What a conversation is expected to reach, in tokens, on a box with no history. This tool's own
-# assumption, not a measurement: at the measured rate it is 1.78 GiB, *under* the 1.86-2.22 GiB the
-# reference box measured — see :func:`estimate_snapshot_mib` for the arithmetic and for why the
-# direction is right for a fresh install and wrong for a box that has been running all day.
+# assumption, not a measurement: at the measured rate it is 1,825 MiB = 1.78 GiB, which sits
+# *between* the readings this box has produced — 1.43-1.62 GiB on 2026-10-18 and 1.86-2.22 GiB on
+# 2026-10-17 (spec §9) — so phase two can come back on either side of it. See :func:`
+# estimate_snapshot_mib` for the arithmetic and for what would invalidate the constant.
 ESTIMATED_CONVERSATION_TOKENS = 110_000
+
+# The script's last-resort snapshot size, for a caller with no measurement, no --snapshot-mib and
+# no context to size from: ``want_snap or measured_snap_mib or theoretical_snap_mib or 2560``
+# (apply-concurrency-fix.sh:208), labelled "fallback 2.5 GiB" at :212. A number in this file rather
+# than a sentence about one, so Task 7 can name it without hardcoding a second copy — the drift the
+# plan's "numbers live in lib/" rule exists to prevent.
+FALLBACK_SNAPSHOT_MIB = 2_560
 
 # The script's label, verbatim (apply-concurrency-fix.sh:210), for the same reason its division is
 # verbatim: one engine, one name for what it measured. The other two are prefixed ``estimate:`` so
@@ -642,31 +652,52 @@ def estimate_snapshot_mib(context: int, expected_tokens: int | None = None,
     What 110,000 is, and what it is not. It is what a **fresh** install's conversations look like
     before they mature. It is NOT the length the reference box's 1.86-2.22 GiB snapshots came from,
     which is how an earlier draft of this function described it: at 17,406 B/token 110,000 tokens
-    is 1,825 MiB = 1.78 GiB, below the 1.86 GiB low end of that range, and inverting the range gives
-    ~114,740 tokens (1.86 GiB) and ~136,947 tokens (2.22 GiB) — so the constant sits under the
-    whole measured range. The measured figures came from a box that had been running since the
-    morning (1.86 GiB at 15:00, 2.22 GiB at 21:00, spec §9), and a first-run estimate is sizing the
-    morning, not the evening: below the low end is the honest direction for a box with no history,
-    on the understanding that the phase-two reading comes back larger. A box that has already been
-    in use a while is under-provisioned by this figure from day one, which is why the tool sends
-    the user to phase two instead of treating this as final. tests/test_sizing.py pins the
-    relationship (1,825 MiB, under 1,904 MiB) so the claim cannot rot into a false one.
+    is 1,825 MiB = 1.78 GiB, and inverting spec §9's range at that rate gives 114,739 tokens
+    (1.86 GiB) and 136,947 tokens (2.22 GiB) — so the constant is below the range measured on
+    2026-10-17, on a box that had been running since the morning (1.86 GiB at 15:00, 2.22 GiB at
+    21:00). It is **above** what the same box read on 2026-10-18: 1,465 MiB = 1.43 GiB across 12
+    parks, and 1,663 MiB = 1.62 GiB, two probes minutes apart — 1.43 GiB is ~88,000 tokens at this
+    rate and 1.62 GiB is ~100,000. The constant therefore sits *between* observed readings, not
+    under them, and the phase-two reading may come back larger or smaller than this estimate;
+    neither direction is the expected one, which is what "this is an estimate, re-measure it" means.
 
-    ``kv`` scales the rate by the engine's own per-cell bytes (:data:`KV_CELL_BYTES`), the check
-    spec §9 names. **Known divergence, deliberately not unified:** for ``k8v4`` this gives
-    816/1056 = 0.77 of the int8 rate — 1,410 MiB at 110,000 tokens — while
-    ``apply-concurrency-fix.sh:188-190`` has no ``k8v4`` key, so there the format falls through to
-    ``KV_FACTOR``'s 1.0 default and reports 1,825 MiB for the same engine and the same config.
-    Reviewer and Task 7: one config, two snapshot sizes, on ``k8v4`` only. Only
-    :data:`KV_FORMATS` are accepted here; the script's wider table (q8_0, int4, q4_k, f16, bf16,
-    f32) raises ``KeyError`` rather than quietly taking that 1.0 default.
+    What would invalidate it. A sustained average parked size materially **above** the 1.86 GiB low
+    end on a box whose conversations are known to be short-lived: that would mean 110,000 tokens is
+    too generous rather than too mean as a length — conversations that short do not reach it — while
+    the 1,825 MiB it produces is still too small a size for what that box parks. The length-to-bytes
+    model would be wrong, not the constant, and the fix is a measurement rather than a nudge. The
+    other direction is the one today's box is in: a sustained average at or under 1.43 GiB means
+    this estimate over-provisions and the slot count comes out too high. spec §9's expiry warning
+    was written from readings that moved only upward (1.86 → 2.22 GiB in six hours); the 2026-10-18
+    readings move the other way, so that warning is bidirectional. tests/test_sizing.py pins the
+    arithmetic half (1,825 MiB, under 1,904 MiB); the direction is a judgement about a box this tool
+    has not seen, and it is the part that goes stale first.
+
+    ``kv`` scales the rate by the engine's own per-cell bytes (:data:`KV_CELL_BYTES`; 816 and 576 at
+    setup.py:198, int8's 1056 at setup.py:197), the check spec §9 names. **Known divergence,
+    deliberately not unified, on two formats — and the two are different kinds of disagreement.** On
+    ``k8v4`` the script has **no key at all**: ``apply-concurrency-fix.sh:188-190`` lists no
+    ``k8v4``, so ``KV_FACTOR.get(kv, 1.0)`` at :190 falls through to 1.0, and the same 110,000
+    tokens cost 1,825 MiB there against 1,410 MiB here (816/1056 = 0.77) — a 22.7% gap, from a
+    missing key. On ``q4_0`` **both files have a key and simply disagree on the number**: 576/1056 =
+    0.545 here against ``"q4_0": 0.5`` at :188 there, 995 MiB against 912 MiB on the same token
+    basis — a 9.1% gap, from a different number, and it runs the other way: here is the larger of
+    the two (at the script's own whole-window basis, 2,373 MiB against 2,175 MiB at 262,144).
+    Reviewer and Task 7: one config, two snapshot sizes, on ``k8v4`` and ``q4_0``; ``int8`` is the
+    only format where the two files agree. Only :data:`KV_FORMATS` are accepted here; the script's
+    wider table (q8_0, int4, q4_k, f16, bf16, f32) raises ``KeyError`` rather than quietly taking
+    that 1.0 default.
 
     Spec §14: the rate is measured on qwen-family GSQ-RCO IQ3_S at 262144 with ``--kv int8``. The
     return is a bare int, so the labelling duty is the caller's — outside the qwen family print
     :data:`NOT_MEASURED` beside it, and never print this as a measurement of the caller's box.
     Truncates toward zero like the script's ``int(...)`` at :191, so the two never differ by a
     rounding step. Returns 0 when ``context`` is 0 — the script's own ``if max_context else 0`` at
-    :191, meaning "no context configured, nothing to size", not "free".
+    :191, meaning "no context configured, nothing to size", not "free". It returns 0 the same way
+    when ``expected_tokens`` is 0 or negative: a conversation of no length parks nothing, so the
+    answer is "nothing to size", and :func:`slots_for_budget` refuses a 0 rather than counting slots
+    against it. That is a documented zero, not a stop — the caller has to label this figure as an
+    estimate either way, and a zero it already handles beats an exception it has to catch.
     """
     tokens = ESTIMATED_CONVERSATION_TOKENS if expected_tokens is None else expected_tokens
     tokens = min(tokens, context)
@@ -694,7 +725,7 @@ def snapshot_from_metrics(parked: int, total_bytes: int) -> tuple[int, str]:
     script then treats a zero as "fall through to the next source" (``want_snap or
     measured_snap_mib or theoretical_snap_mib or 2560``, :208) and never sizes from it, so a 0 here
     means **"no measurement exists — do not size from this"**, and the caller must substitute
-    :func:`estimate_snapshot_mib` (or the script's own 2,560 MiB fallback) before computing a
+    :func:`estimate_snapshot_mib` (or :data:`FALLBACK_SNAPSHOT_MIB`, that 2,560) before computing a
     budget or a slot count. Task 7 leans on this contract, and :func:`slots_for_budget` refuses a 0
     so the substitution cannot be skipped by accident.
     """
@@ -717,11 +748,16 @@ def slots_for_budget(budget_mib: int, snapshot_mib: int) -> int:
     this one (and report 5 slots where 14 fit), so this function takes two arguments and multiplies
     by nothing.
 
-    Rounds up, matching the script at :269-272 (``max(1, -(-budget_mib // snapshot_mib))``): a
-    floor leaves ``budget_mib - slots * snapshot_mib`` as budget that can never park anything, the
-    dead capacity the script's own comment calls out. At 30,720 MiB and 2,272 MiB that is 14 slots,
-    not 13 — 13 leave 1,184 MiB idle. The ``max(1, ...)`` floor is the script's too: a budget under
-    one snapshot still gets one slot.
+    Rounds up, matching the script at :272 (``max(1, -(-budget_mib // snapshot_mib))``): a floor
+    leaves ``budget_mib - slots * snapshot_mib`` as budget that can never park anything, the dead
+    capacity the script's own comment at :269-271 calls out. At 30,720 MiB and 2,272 MiB that is 14
+    slots, not 13 — 13 leave 1,184 MiB idle. The ``max(1, ...)`` floor is the script's too: a budget
+    under one snapshot still gets one slot, and a **negative** budget is that case taken past its
+    meaning. A negative budget is not a meaningful input here — the script's own budget comes from
+    ``min(need_mib, ram_allowance_mib)`` at :255, and ``ram_allowance_mib`` is floored at 0 at :254,
+    so it cannot go negative — and this reproduces the script's floor rather than validating the
+    caller: -5,000 answers 1, the same as 0. Documented rather than a stop, because the line it
+    mirrors answers 1 and a stop here would make the two files disagree about the same input.
 
     ``snapshot_mib`` 0 raises instead of answering. 0 is what :func:`snapshot_from_metrics` returns
     when no measurement exists, and dividing by it would print a slot count with no size behind it
