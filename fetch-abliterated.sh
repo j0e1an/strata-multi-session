@@ -24,7 +24,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 usage() {
   cat <<'EOF'
-usage: fetch-abliterated.sh --tier TIER --dir DIR [--link-shard2 PATH] [--refresh] [--print]
+usage: fetch-abliterated.sh --tier TIER [--dir DIR] [--link-shard2 PATH] [--refresh] [--print]
 
   --tier TIER        Q2_0, IQ2_XS, IQ3_XXS or IQ3_S — the four tiers that exist uncensored
   --dir DIR          where the shards go (default $STRATA_DATA/models/<TIER>-abliterated)
@@ -253,7 +253,7 @@ while IFS='|' read -r role file bytes oid url source; do
     exit 1
   fi
   printf '%s' "$(date '+%Y-%m-%d %H:%M')" > "$target.done"
-  echo "$file hard-linked from $source ($bytes bytes, identical LFS oid $oid)"
+  echo "$file hard-linked from $source ($bytes bytes, the catalog's shared oid $oid; size-matched, not re-hashed)"
 done <<EOF
 $plan
 EOF
