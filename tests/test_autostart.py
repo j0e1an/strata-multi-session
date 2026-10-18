@@ -23,6 +23,13 @@ actually accept, which is not what the plan assumed:
   starts the server somewhere nothing else in the install expects. The interpreter is an
   argument for the same reason: upstream's launcher uses ``sys.executable``, the venv, and
   ``detect.detect()`` already returns ``venv_python`` for this handoff.
+* **Linux logs to the journal, and the enable line runs its steps independently.** No
+  ``StandardOutput=`` in the unit: spec §11 says Linux logs through ``journalctl --user -u
+  strata``, and a redirect to a file both empties the journal and fails the start when the
+  directory is missing. In ``enable_commands`` the ``loginctl`` step is separated by ``;`` rather
+  than ``&&``, because ``systemctl --user enable --now`` exits 1 when the *start* job fails and a
+  gated linger step is skipped exactly when it is needed. Two tests execute those lines against
+  stub managers on ``PATH`` -- the only way to pin which steps really run.
 
 The module renders strings and returns commands; it never writes a file and never runs
 ``systemctl``/``launchctl`` (Task 7 decides whether to run what it gets back). Two tests guard
@@ -57,6 +64,58 @@ def exec_start(unit: str) -> list[str]:
     lines = [ln for ln in unit.splitlines() if ln.startswith("ExecStart=")]
     assert len(lines) == 1, lines
     return shlex.split(lines[0][len("ExecStart="):])
+
+
+# A stand-in for a service manager: fail the enable/disable verb the way the real one does when the
+# *start* job fails (measured on this box 2026-10-18 with a throwaway user unit whose ExecStart was
+# /bin/false: `systemctl --user enable --now` exited 1, unit enabled, not running), and log the
+# exit code it used. daemon-reload stays 0 so a `&&` chain still reaches the enable. The exit code
+# is what the log carries — not a separate "this failed" marker — so a test cannot be told the
+# enable failed by a stub that then exits 0.
+STUB_MANAGER = """#!/bin/sh
+rc=0
+case " $* " in *" enable "*|*" disable "*) rc=1 ;; esac
+printf '%s\\t%s\\t%s\\n' 'NAME' "$*" "$rc" >> "$STUB_LOG"
+exit "$rc"
+"""
+
+# Fixed so the logged line does not move with whoever runs the suite.
+STUB_USER = "strata-test-user"
+
+
+def manager_calls_for(cmd: str) -> tuple[list[str], list[str], int]:
+    """Run one enable/undo line through /bin/sh with fake managers on ``PATH``.
+
+    Returns ``(calls, failed, returncode)``: every manager call in order, the subset whose stub
+    exited non-zero, and the line's own exit status. This is the only way to pin "the linger step is
+    not gated behind systemctl's exit status" without trusting my reading of the string — the real
+    line is executed, the systemctl stub fails the enable the way the box does, and the log says
+    whether ``loginctl`` was reached anyway. Callers assert ``failed`` is non-empty so the pin can
+    never go vacuous by the stub quietly stopping failing.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        logfile = os.path.join(d, "calls")
+        for name in ("systemctl", "loginctl", "launchctl"):
+            script = os.path.join(d, name)
+            with open(script, "w", encoding="utf-8") as f:
+                f.write(STUB_MANAGER.replace("NAME", name))
+            os.chmod(script, 0o755)
+        env = dict(os.environ, PATH=d + os.pathsep + os.environ.get("PATH", ""),
+                   STUB_LOG=logfile, USER=STUB_USER)
+        proc = subprocess.run(cmd, shell=True, env=env, capture_output=True, text=True,
+                              check=False)
+        calls, failed = [], []
+        if os.path.exists(logfile):            # no file at all: nothing in the line ran
+            with open(logfile, encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    name, args, rc = line.rstrip("\n").split("\t")
+                    call = (name + " " + args).strip()
+                    calls.append(call)
+                    if rc != "0":
+                        failed.append(call)
+        return calls, failed, proc.returncode
 
 
 class TestUnitPath(unittest.TestCase):
@@ -129,15 +188,19 @@ class TestLinuxUnit(unittest.TestCase):
         self.assertNotIn("WorkingDirectory=~", autostart.render(
             "linux", "~/Strata/serve/server.py", CONFIG, LOG))
 
-    def test_the_log_path_is_where_the_units_output_goes(self):
-        # render() takes a log path or the argument is a lie; `append:` rather than `file:` so a
-        # restart does not truncate the crash it is there to explain.
+    def test_the_linux_unit_logs_to_the_journal_not_a_file(self):
+        # spec §11: Linux "logs through `journalctl --user -u strata`". A StandardOutput= redirect
+        # moves the server's output out of the journal, and measured on this box 2026-10-18 it is a
+        # start failure waiting to happen too: `append:` against a parent directory that does not
+        # exist fails the start outright, `ExecStart=/bin/false (code=exited, status=209/STDOUT)`.
+        # render() still takes `log` — the plist needs it — but on Linux it must not reach the body.
         u = self.unit(port=18080)
-        self.assertIn("StandardOutput=append:" + LOG, u)
-        self.assertIn("StandardError=append:" + LOG, u)
-        self.assertIn("StandardOutput=append:" + os.path.join(os.path.expanduser("~"),
-                                                              "Strata-data/logs/strata.log"),
-                      autostart.render("linux", SERVER, CONFIG, "~/Strata-data/logs/strata.log"))
+        self.assertNotIn("StandardOutput", u)
+        self.assertNotIn("StandardError", u)
+        self.assertNotIn("append:", u)
+        self.assertNotIn(LOG, u)
+        self.assertNotIn("StandardOutput", autostart.render(
+            "linux", SERVER, CONFIG, "~/Strata-data/logs/strata.log"))
 
     def test_a_relative_server_path_is_resolved_but_a_bare_program_name_is_not(self):
         # Two halves of one rule, found by systemd-analyze verify: a relative *path* would leave
@@ -240,12 +303,47 @@ class TestEnableCommands(unittest.TestCase):
         self.assertIn("systemctl --user disable", undo)
         self.assertIn("loginctl disable-linger", undo)
 
+    def test_linux_linger_runs_even_when_the_start_job_fails(self):
+        # The `&&` between systemctl and loginctl is the bug: measured on this box 2026-10-18,
+        # `systemctl --user enable --now` exits 1 when the *start* job fails although the unit is
+        # enabled. Gated, linger is skipped exactly then and spec §11's "starts without anyone
+        # logging in" goes unmet with no error naming it. The stub fails the enable the way the
+        # box does, so this runs the real line and reads which steps actually ran.
+        enable, _undo = autostart.enable_commands("linux")
+        calls, failed, rc = manager_calls_for(enable)
+        self.assertIn("systemctl --user daemon-reload", calls)
+        self.assertIn("systemctl --user enable --now strata.service", calls)
+        # The enable really failed here — otherwise "linger ran" proves nothing about the gating.
+        self.assertIn("systemctl --user enable --now strata.service", failed)
+        self.assertIn("loginctl enable-linger " + STUB_USER, calls)
+        # The documented price of `;`: the line's status is loginctl's, so a caller that wants the
+        # systemctl failure as an exit code has to run the steps itself.
+        self.assertEqual(rc, 0)
+
+    def test_linux_undo_turns_linger_off_even_when_disable_fails(self):
+        # The same coupling in reverse: a failed `disable` must not skip disable-linger, or linger
+        # stays on for a unit that no longer exists. Enable and undo decouple symmetrically.
+        _enable, undo = autostart.enable_commands("linux")
+        calls, failed, _rc = manager_calls_for(undo)
+        self.assertIn("systemctl --user disable --now strata.service", calls)
+        self.assertIn("systemctl --user disable --now strata.service", failed)
+        self.assertIn("loginctl disable-linger " + STUB_USER, calls)
+
     def test_mac_enable_and_undo_address_the_same_plist(self):
         enable, undo = autostart.enable_commands("darwin")
         self.assertIn("launchctl", enable)
         self.assertIn(autostart.unit_path("darwin"), enable)
         self.assertIn("launchctl", undo)
         self.assertIn(autostart.unit_path("darwin"), undo)
+
+    def test_mac_undo_carries_w_or_the_agent_loads_again_at_login(self):
+        # `load -w` overrides the agent's Disabled key; `man launchctl`: "-w Overrides the Disabled
+        # key and sets it to false or true for the load and unload subcommands respectively". So
+        # `unload` without -w removes the job for the current session only and the LaunchAgent is
+        # back at the next login — the printed undo would have undone nothing.
+        enable, undo = autostart.enable_commands("darwin")
+        self.assertEqual(shlex.split(enable)[:3], ["launchctl", "load", "-w"])
+        self.assertEqual(shlex.split(undo)[:3], ["launchctl", "unload", "-w"])
 
     def test_nothing_anywhere_needs_a_password(self):
         # spec §11: "neither needs a password" covers the commands, not just the unit text.
