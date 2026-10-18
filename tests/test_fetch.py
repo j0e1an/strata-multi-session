@@ -280,7 +280,8 @@ cp "$STUB_CURL_PAYLOAD" "$out"
     def test_download_is_resumable_and_retried(self):
         # -C - and --retry are what let a 51 GiB download survive a dropped connection. They
         # change nothing in the script's output, so the stub's recorded arguments are the only
-        # way to see them.
+        # way to see them. The counts are pinned too: `--retry 1 --retry-delay 1` would satisfy
+        # a bare assertIn and still give up on the first blip of a two-hour transfer.
         payload = b"resumable, retried, and small enough to hash"
         script = self.scratch_repo("IQ2_XS", 0, len(payload),
                                    hashlib.sha256(payload).hexdigest())
@@ -293,6 +294,9 @@ cp "$STUB_CURL_PAYLOAD" "$out"
         self.assertIn("-C", args)
         self.assertEqual(args[args.index("-C") + 1], "-")
         self.assertIn("--retry", args)
+        self.assertEqual(args[args.index("--retry") + 1], "8")
+        self.assertIn("--retry-delay", args)
+        self.assertEqual(args[args.index("--retry-delay") + 1], "5")
 
     def test_shard_already_on_disk_at_the_expected_size_is_verified_without_curl(self):
         # A crash between "curl finished" and "marker written" must not re-fetch: the file on
