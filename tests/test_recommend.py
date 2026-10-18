@@ -1,6 +1,21 @@
+import os
+import re
 import unittest
+from unittest import mock
 
 from lib import catalog, recommend
+
+# apply-concurrency-fix.sh is the shipped script whose budget arithmetic lib/recommend.py now
+# reproduces. The cross-file pins below read its own lines rather than trusting prose, so moving a
+# number there fails here instead of leaving lib describing a figure the script no longer uses.
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CONCURRENCY_SCRIPT = os.path.join(REPO, "apply-concurrency-fix.sh")
+
+
+def script_lines():
+    with open(CONCURRENCY_SCRIPT, encoding="utf-8") as fh:
+        return fh.read().splitlines()
+
 
 # The three boxes the plan pins, with every *_mib in real MiB (Task 2's units fix). BIG is the
 # reference box exactly as detect() reads it on this machine (2x RTX 5090 at 32607 MiB each, summed
@@ -359,6 +374,239 @@ class TestRecommend(unittest.TestCase):
         # Fail closed on a missing key too: detect() always answers it, but a hand-built box dict
         # must not become a recommendation by omission.
         self.assertIsNone(recommend.recommend({"os": "linux", "ram_mib": 60240})["tier"])
+
+
+class TestForcedPlan(unittest.TestCase):
+    """forced_plan(): the --tier answer, which used to be a second copy of lib's arithmetic.
+
+    bootstrap.sh rebuilt _kv_plan, _disk_gb and _ceiling out of lib's public constants because
+    they were private, and the copy drifted silently: the tests pinned the numbers this box
+    produced, not the library's identity. These pins are what make the numbers reachable without
+    spawning the script, and they are the reason the entry point can stop owning them.
+    """
+
+    def test_forced_plan_agrees_with_the_recommender_on_the_same_tier(self):
+        # The whole point of moving it: a tier reached through --tier and the same tier reached as
+        # a recommendation cannot report two different figures for one box.
+        offered = recommend.recommend(BIG)
+        forced = recommend.forced_plan(BIG, offered["tier"])
+        for key in ("context", "kv", "low_ram", "extra_disk_gb", "ceiling", "relief",
+                    "abliterated"):
+            self.assertEqual(forced[key], offered[key], key)
+        self.assertTrue(forced["forced"])
+        self.assertEqual(forced["alternatives"], [])
+
+    def test_forced_plan_carries_the_keys_task_7_prints_plus_its_own_three(self):
+        keys = {"tier", "abliterated", "reason", "context", "kv", "low_ram", "extra_disk_gb",
+                "ceiling", "relief", "alternatives", "forced", "fits_in_ram", "ram_gib"}
+        for name in ("IQ3_S", "UD-Q6_K_XL", "IQ1_M"):
+            self.assertEqual(set(recommend.forced_plan(BIG, name)), keys)
+
+    def test_forced_plan_labels_the_carry_over_rate_outside_the_measured_family(self):
+        # spec §14, in the reason a forced tier prints: the ladder below the verdict is built on
+        # the measured 17,406 B/token rate, so an Unsloth tier has to say it was not measured
+        # there. The qwen tier beside it must not, or the caveat is decoration.
+        self.assertIn("not measured on this tier",
+                      recommend.forced_plan(BIG, "UD-Q6_K_XL")["reason"])
+        self.assertNotIn("not measured on this tier",
+                         recommend.forced_plan(BIG, "IQ3_S")["reason"])
+
+    def test_forced_plan_does_not_claim_the_low_ram_mode_for_a_budget_true_tier(self):
+        # The contradiction this replaces: fits() answers (True, False) for UD-Q6_K_XL here —
+        # low_ram_fits closes the RAM gap on the card's VRAM, but _low_ram_applies refuses the
+        # mode because Unsloth's budget: True rows are exempt (setup.py:4051). Gating the sentence
+        # on fits_in_ram printed "upstream's installer will put it in the low-RAM mode" beside a
+        # disk figure with no arena in it.
+        plan = recommend.forced_plan(BIG, "UD-Q6_K_XL")
+        self.assertTrue(plan["fits_in_ram"])
+        self.assertFalse(plan["low_ram"])
+        self.assertNotIn("will put it in the low-RAM mode", plan["reason"])
+        self.assertNotIn("low-RAM mode applies here", plan["reason"])
+        # The exemption is stated instead, so the answer is still not "cannot run the model".
+        self.assertIn("exempt from the mode itself", plan["reason"])
+        self.assertIn("budget: True", plan["reason"])
+        self.assertIn("not at a published floor", plan["reason"])
+        # And the disk figure really is the download alone, which is what the prose now claims.
+        self.assertAlmostEqual(plan["extra_disk_gb"], catalog.download_bytes("UD-Q6_K_XL") / 1e9,
+                               places=1)
+
+    def test_forced_plan_still_says_the_low_ram_mode_where_the_mode_applies(self):
+        # Two sentences, both gated on low_ram rather than on fits_in_ram. On the reference box
+        # IQ3_S sits inside the tight band, so the verdict is "tight" and only the arena sentence
+        # runs; on a 40 GiB box it is past the band and the card closes the gap, which is the
+        # branch that used to fire for Unsloth tiers too. 40 - 6 + 58.7 >= 50.3 (setup.py:4039-
+        # 4042), and 40 < arena_gb + 10 (:4011-4014), so both halves are true here.
+        on_box = recommend.forced_plan(BIG, "IQ3_S")
+        self.assertTrue(on_box["low_ram"])
+        self.assertIn("low-RAM mode applies here", on_box["reason"])
+        self.assertAlmostEqual(on_box["extra_disk_gb"],
+                               catalog.download_bytes("IQ3_S") / 1e9
+                               + catalog.TIERS["IQ3_S"]["arena_gb"] + 1, places=1)
+
+        card_closed = recommend.forced_plan({**BIG, "ram_mib": 40_960}, "IQ3_S")
+        self.assertTrue(card_closed["low_ram"])
+        self.assertTrue(card_closed["fits_in_ram"])
+        self.assertIn("past the tight band", card_closed["reason"])
+        self.assertIn("will put it in the low-RAM mode", card_closed["reason"])
+        self.assertIn("low-RAM mode applies here", card_closed["reason"])
+
+    def test_forced_plan_names_the_three_state_verdict_it_is_in(self):
+        # Upstream's ladder (setup.py:6092, :6111), one branch per rung, so a reader can tell
+        # which verdict was reached rather than reading a sentence that fits all three.
+        clears = recommend.forced_plan({**BIG, "ram_mib": 131_072}, "UD-Q6_K_XL")
+        self.assertIn("clears its published floor", clears["reason"])
+        tight = recommend.forced_plan(BIG, "IQ3_S")
+        self.assertIn("inside the 8 GiB band", tight["reason"])
+        # Past the band, closed by the card, mode exempt: the branch above.
+        self.assertIn("past the tight band",
+                      recommend.forced_plan(BIG, "UD-Q6_K_XL")["reason"])
+
+
+class TestCarryOverNote(unittest.TestCase):
+    """spec §14's caveat as a function, so a caller cannot print a carried-over figure and forget
+    the warning beside it."""
+
+    def test_the_measured_family_gets_no_note_at_all(self):
+        for name in catalog.abliterated_tiers():
+            self.assertEqual(recommend.carry_over_note(name), "")
+            self.assertEqual(recommend.carry_over_rate_note(name), "")
+
+    def test_every_other_family_gets_the_warning(self):
+        for name in ("IQ1_M", "UD-Q4_K_XL", "UD-Q6_K_XL", "NVFP4", "Q8_0"):
+            self.assertIn("not measured on this tier", recommend.carry_over_note(name))
+            self.assertIn("not measured on this tier", recommend.carry_over_rate_note(name))
+
+    def test_the_rate_wording_and_the_figure_wording_are_not_the_same_sentence(self):
+        # §14 lists four measured figures, only one of which is a rate. One string covering all
+        # four would have to say "that rate" beside a count of parked conversations, which is how
+        # the caveat stops being read.
+        self.assertIn("that rate", recommend.carry_over_rate_note("UD-Q6_K_XL"))
+        self.assertNotIn("that rate", recommend.carry_over_note("UD-Q6_K_XL"))
+
+
+class TestPhaseOneBudget(unittest.TestCase):
+    """phase_one_budget(): the budget apply-concurrency-fix.sh computes, reachable without a GPU."""
+
+    def test_the_parks_per_session_count_is_the_scripts_own_default(self):
+        # Read off the script's line rather than quoted in prose: :241 is the source of the 3, and
+        # a change there has to fail here instead of leaving lib's comment describing a number
+        # the script no longer uses.
+        line = next(l for l in script_lines() if l.startswith("per_session = max("))
+        self.assertEqual(int(line.rsplit("else ", 1)[1].rstrip(")")),
+                         recommend.PER_SESSION_PARKS)
+        self.assertEqual(recommend.PER_SESSION_PARKS, 3)
+
+    def test_the_reserve_is_the_scripts_own_floor_and_share(self):
+        line = next(l for l in script_lines() if l.startswith("reserve_mib = max("))
+        floor, share = re.match(r"reserve_mib = max\((\d+), int\(detected\[\"memtotal_mib\"\] "
+                                r"\* ([\d.]+)\)\)", line).groups()
+        self.assertEqual(int(floor), recommend.RAM_RESERVE_FLOOR_MIB)
+        self.assertEqual(float(share), recommend.RAM_RESERVE_SHARE)
+
+    def test_the_budget_is_the_scripts_arithmetic_line_for_line(self):
+        # Literals copied from apply-concurrency-fix.sh:241 (the 3), :253 (the reserve), :254 (the
+        # allowance), :255 (the cap) and :266 (the whole-GiB round-up), with the slots coming from
+        # slots_for_budget, itself pinned to the script's ceil at :272.
+        ram_mib, sessions, snapshot = 60_484, 4, 1_825
+        reserve = max(6400, int(ram_mib * 0.11))
+        allowance = max(0, ram_mib - reserve)
+        need = sessions * 3 * snapshot
+        budget = ((min(need, allowance) + 1023) // 1024) * 1024
+        got = recommend.phase_one_budget(ram_mib, sessions, snapshot)
+        self.assertEqual(got["reserve_mib"], reserve)
+        self.assertEqual(got["allowance_mib"], allowance)
+        self.assertEqual(got["budget_mib"], budget)
+        self.assertEqual(got["budget_mib"], 22_528)          # what the plan prints on this box
+        self.assertEqual(got["slots"], max(1, -(-budget // snapshot)))
+        self.assertEqual(got["slots"], 13)
+        self.assertFalse(got["capped"])
+        self.assertFalse(got["fallback"])
+
+    def test_the_plan_says_when_the_ram_allowance_caps_the_budget(self):
+        # 16 GiB of RAM: the allowance is 16384 - 6400 = 9984 MiB, under the 4 x 3 x 1825 = 21900
+        # the sessions ask for, so the box gets less than it wanted and capped has to be True —
+        # the flag that makes the plan name the reserve instead of hiding it.
+        got = recommend.phase_one_budget(16_384, 4, 1_825)
+        self.assertTrue(got["capped"])
+        self.assertLess(got["budget_mib"], 21_900)
+
+    def test_a_zero_snapshot_becomes_the_scripts_fallback_and_says_so(self):
+        # estimate_snapshot_mib's documented zero (no context to size from) arriving here.
+        # slots_for_budget refuses a 0, so the substitution has to happen before the division —
+        # and the caller has to be able to tell, because a figure labelled an estimate is still an
+        # estimate when it turns out to be the fallback.
+        got = recommend.phase_one_budget(60_484, 4, 0)
+        self.assertTrue(got["fallback"])
+        self.assertEqual(got["snapshot_mib"], recommend.FALLBACK_SNAPSHOT_MIB)
+        self.assertGreater(got["slots"], 0)
+        self.assertEqual(recommend.phase_one_budget(60_484, 4, -5), got)
+
+
+class TestDiskPreflight(unittest.TestCase):
+    """disk_preflight(): the figure the preflight refuses on, including stage 1's stock download."""
+
+    def test_stock_download_bytes_is_the_censored_figure_for_an_abliterated_tier(self):
+        # lib/catalog's two-download-figures note: on the four abliterated rows download_gb is
+        # ISTA's censored file and download_bytes() is SC117's larger re-quantization. Stage 1
+        # fetches the former and stage 2 the latter, and they are different files.
+        for name in catalog.abliterated_tiers():
+            self.assertEqual(recommend.stock_download_bytes(name),
+                             round(catalog.TIERS[name]["download_gb"] * 1e9))
+            self.assertLess(recommend.stock_download_bytes(name),
+                            catalog.download_bytes(name))
+
+    def test_stage_one_adds_the_stock_tiers_non_shared_bytes(self):
+        # The under-reserve this fixes: a fresh box was told ok at 135.2 GB for IQ3_S and then
+        # needed ~55 GB more, with the failure landing inside upstream's own free-disk check
+        # (setup.py:6418). The 54.8 is the stock 83.6 less the 28.8 shard 2 the two builds share.
+        base = recommend.disk_preflight(BIG, "IQ3_S")
+        with_stage = recommend.disk_preflight(BIG, "IQ3_S", stage_one_downloads=True)
+        self.assertEqual(base["stock_gb"], 0.0)
+        self.assertFalse(base["stage_one_stock"])
+        self.assertTrue(with_stage["stage_one_stock"])
+        self.assertAlmostEqual(with_stage["stock_gb"], 54.8, places=1)
+        self.assertAlmostEqual(with_stage["need_gb"] - base["need_gb"], 54.8, places=1)
+        self.assertEqual(with_stage["tier_gb"], base["need_gb"])
+
+    def test_a_stock_copy_already_on_disk_is_not_asked_for_twice(self):
+        held = recommend.disk_preflight(BIG, "IQ3_S", stage_one_downloads=True,
+                                        stock_copy_held=True)
+        self.assertFalse(held["stage_one_stock"])
+        self.assertEqual(held["stock_gb"], 0.0)
+        self.assertEqual(held["need_gb"], recommend.disk_preflight(BIG, "IQ3_S")["need_gb"])
+
+    def test_a_censored_tier_never_pays_for_a_second_download(self):
+        # On the stock path stage 1 downloads the tier itself, which _disk_gb already counted.
+        for name in ("UD-Q6_K_XL", "IQ1_M", "Q8_0"):
+            got = recommend.disk_preflight(BIG, name, stage_one_downloads=True)
+            self.assertEqual(got["stock_gb"], 0.0, name)
+            self.assertFalse(got["stage_one_stock"], name)
+
+    def test_the_shared_shard2_saving_and_the_stage_one_bytes_are_independent(self):
+        # Both subtractions are real and neither may swallow the other: holding the shard 2 takes
+        # 28.8 GB off the abliterated figure, and stage 1 still adds the stock non-shared bytes.
+        held = recommend.disk_preflight({**BIG, "has_shared_shard2": True}, "IQ3_S",
+                                        stage_one_downloads=True)
+        plain = recommend.disk_preflight(BIG, "IQ3_S", stage_one_downloads=True)
+        self.assertAlmostEqual(plain["need_gb"] - held["need_gb"],
+                               catalog.shared_shard2()[0] / 1e9, places=1)
+        self.assertTrue(held["shared_shard2_held"])
+
+    def test_need_gb_stays_unknown_when_the_download_figure_is(self):
+        # No honest tier figure means no honest total: the preflight says it cannot tell rather
+        # than adding the stock bytes onto nothing.
+        with mock.patch.object(recommend.catalog, "download_bytes", lambda name: None):
+            got = recommend.disk_preflight(BIG, "IQ3_S", stage_one_downloads=True)
+        self.assertIsNone(got["tier_gb"])
+        self.assertIsNone(got["need_gb"])
+
+    def test_the_arena_key_matches_the_low_ram_answer_the_plan_prints(self):
+        on = recommend.disk_preflight(BIG, "IQ3_S")
+        self.assertTrue(on["low_ram"])
+        self.assertAlmostEqual(on["arena_gb"], catalog.TIERS["IQ3_S"]["arena_gb"] + 1, places=1)
+        off = recommend.disk_preflight(ROOMIER, "IQ3_S")
+        self.assertFalse(off["low_ram"])
+        self.assertEqual(off["arena_gb"], 0.0)
 
 
 if __name__ == "__main__":

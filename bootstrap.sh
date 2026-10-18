@@ -16,9 +16,13 @@
 #   6. the phase-one sizing, labelled an estimate        §9's two phases
 #   7. the stages --apply would run: install, fetch, pack, config, concurrency, vision, autostart
 #
-# Everything numeric comes out of lib/, so this file owns no measured figure: it sequences, it
-# refuses, and it runs the scripts that already do the work — fetch-abliterated.sh and
-# apply-concurrency-fix.sh as subprocesses, because spec §5 says call it, do not fork it.
+# Every figure the plan computes comes out of lib/, so this file owns no sizing arithmetic and no
+# measured constant: it sequences, it refuses, and it runs the scripts that already do the work —
+# fetch-abliterated.sh and apply-concurrency-fix.sh as subprocesses, because spec §5 says call it,
+# do not fork it. What it still owns, precisely, is two measured READINGS quoted in prose rather
+# than computed — the CPU encode curve in the vision section and the dated parked-snapshot readings
+# in the sizing section — each naming its box and its date, and each carrying spec §14's
+# "not measured on this tier" caveat whenever the chosen tier is outside the qwen family.
 #
 # --apply is what writes or downloads. Without it the script prints the plan and changes nothing:
 # no directory is created, no file is written, no byte is fetched.
@@ -231,11 +235,6 @@ from lib import autostart, catalog, detect, recommend
 MIB = 1_048_576
 GB = 1e9
 
-# apply-concurrency-fix.sh:241-243: one live session parks MORE than one conversation over time
-# (four sessions produced 99 parks against 12 slots on the reference box). Sizing the budget as
-# sessions x ONE snapshot under-provisions it, so the script multiplies by 3 and so does this.
-PER_SESSION_PARKS = 3
-
 
 def col(label, value=""):
     print("%-16s%s" % (label, value))
@@ -341,86 +340,11 @@ box["has_shared_shard2"] = bool(shard2_hits)
 plan = recommend.recommend(box, sessions=sessions, want_abliterated=want_abl)
 plans = [plan] + (plan["alternatives"] if plan["tier"] else [])
 
-
-def forced_plan(name):
-    """A plan for a tier --tier names but the recommender did not offer.
-
-    recommend._plan() is private and lib/ is not this task's to edit, so the two figures this
-    needs — the KV ladder against this tier's arena, and the disk total — are rebuilt here out of
-    recommend's public constants, mirroring _kv_plan and _disk_gb. If those change, this copy has
-    to follow; the alternative is refusing a tier the user explicitly asked for.
-    """
-    row = catalog.TIERS[name]
-    ram = box.get("ram_mib", 0) / 1024.0
-    vram = box.get("vram_mib", 0) / 1024.0
-    room = (max(0.0, vram - recommend.DENSE_WEIGHTS_GB)
-            - recommend.EXPERT_CACHE_MIN_SHARE * row["arena_gb"])
-    context = kv = None
-    for fmt in recommend.KV_FORMATS:
-        for ctx in reversed(recommend.CONTEXT_LADDER):
-            per_tok = (recommend.KV_BYTES_PER_TOKEN_INT8 * recommend.KV_CELL_BYTES[fmt]
-                       / recommend.KV_CELL_BYTES["int8"])
-            if ctx * per_tok / GB <= room:
-                context, kv = ctx, fmt
-                break
-        if context:
-            break
-    if context is None:
-        context, kv = recommend.CONTEXT_LADDER[0], recommend.KV_FORMATS[-1]
-    fits_in_ram, low_ram = recommend.fits(box, row)
-    total = catalog.download_bytes(name)
-    disk = None
-    if total is not None:
-        gb = total / GB
-        if box["has_shared_shard2"] and row["abliterated"]:
-            gb -= ple_bytes / GB
-        if low_ram:
-            gb += row["arena_gb"] + 1
-        disk = round(gb, 1)
-    if context < recommend.TRAINED_CONTEXT:
-        ceiling = "vram"
-        relief = ("--context %d" % context if os_name == "darwin"
-                  else "--max-context %d --kv %s" % (context, kv))
-    elif ram - row["ram_gb"] < recommend.AGENT_CACHE_FREE_GB:
-        # metal/setup_mac.py has no conversation-cache flag, so on a Mac this is not a ceiling
-        # this tool can relieve (spec §9: one that drives no flag is decoration).
-        ceiling, relief = ("none", "") if os_name == "darwin" else (
-            "ram", "--conversation-cache-mib / --conversation-cache-slots")
-    else:
-        ceiling, relief = "none", ""
-    # The reason the tier section prints, for a tier recommend() never planned. The verdict wording
-    # follows upstream's own three-state ladder (setup.py:6092, :6111) rather than a floor test, so
-    # a tier the user forced is described the way upstream's --check would describe it.
-    parts = ["%s: chosen with --tier, not recommended by this box." % name,
-             "This box reports %.1f GiB of RAM and %.1f GiB of VRAM." % (ram, vram)]
-    if ram >= row["ram_gb"]:
-        parts.append("It clears its published floor of %d GiB." % row["ram_gb"])
-    elif ram >= row["ram_gb"] - recommend.TIGHT_BAND_GB:
-        parts.append("it sits %.1f GiB under the %d GiB floor, inside the %d GiB band upstream's own "
-                     "verdict calls \"tight\" rather than \"does not fit\" (setup.py:6092)."
-                     % (row["ram_gb"] - ram, row["ram_gb"], recommend.TIGHT_BAND_GB))
-    elif fits_in_ram:
-        parts.append("it sits %.1f GiB under the %d GiB floor, past the tight band, but upstream's "
-                     "low-RAM-mode test (setup.py:4039-4042) still passes here: the card holds what "
-                     "it can of the %s GB expert arena and the rest is read from the SSD, so "
-                     "upstream's installer will put it in the low-RAM mode. That is \"not at a "
-                     "published floor\", not \"this machine cannot run the model\"."
-                     % (row["ram_gb"] - ram, row["ram_gb"], row["arena_gb"]))
-    if row["abliterated"]:
-        parts.append("This is the uncensored build.")
-    else:
-        parts.append("This is the censored model: the uncensored builds exist at %s only."
-                     % ", ".join(catalog.abliterated_tiers()))
-    parts.append("The context and KV format below are this tool's ladder against this tier's %s GB "
-                 "expert arena, rebuilt from lib/recommend's public constants because _kv_plan() is "
-                 "private and lib/ is not this task's to edit." % row["arena_gb"])
-    if low_ram:
-        parts.append("The low-RAM mode applies here (setup.py:4011-4014), so the %s GB expert arena "
-                     "is part of the disk figure." % (row["arena_gb"] + 1))
-    return {"tier": name, "abliterated": row["abliterated"], "context": context, "kv": kv,
-            "low_ram": low_ram, "extra_disk_gb": disk, "ceiling": ceiling, "relief": relief,
-            "reason": " ".join(parts), "alternatives": [], "forced": True,
-            "fits_in_ram": fits_in_ram, "ram_gib": ram}
+# A tier --tier names that recommend() did not offer goes through recommend.forced_plan(), which
+# builds it from the same _kv_plan / _disk_gb / _ceiling the recommender uses. The orchestrator
+# used to rebuild those three here out of recommend's public constants, and the copy drifted
+# silently whenever the library's shape moved; it is lib's answer now, and tests/test_recommend.py
+# pins it without a GPU.
 
 
 if plan["tier"] is None:
@@ -428,8 +352,8 @@ if plan["tier"] is None:
     print("stop")
     print(wrap(plan["reason"]))
     smallest = min(catalog.tiers_for(os_name), key=lambda n: catalog.TIERS[n]["ram_gb"])
-    fits_in_ram, _low = recommend.fits(box, catalog.TIERS[smallest])
-    if fits_in_ram:
+    fits_in_ram, low_ram = recommend.fits(box, catalog.TIERS[smallest])
+    if fits_in_ram and low_ram:
         print(wrap("That is this tool's answer, not upstream's. The smallest tier here, %s, still "
                    "passes upstream's low-RAM-mode test (setup.py:4039-4042) on this box: the card "
                    "holds what it can of its %s GB expert arena and the rest is read from the SSD, "
@@ -453,7 +377,9 @@ if tier_wanted:
                    "installer that would refuse it (spec §8)."
                    % ", ".join(catalog.tiers_for("darwin"))))
         sys.exit(1)
-    chosen = next((p for p in plans if p["tier"] == tier_wanted), None) or forced_plan(tier_wanted)
+    chosen = (next((p for p in plans if p["tier"] == tier_wanted), None)
+              or recommend.forced_plan(box, tier_wanted, sessions=sessions,
+                                       want_abliterated=want_abl))
 
 tier = chosen["tier"]
 tier_l = tier.lower()
@@ -463,6 +389,13 @@ model_dir = os.path.join(data_dir, "models", "%s-abliterated" % tier if abl else
 pack_dir = os.path.join(data_dir, "packs", "%s_abliterated" % tier_l if abl else tier_l)
 config = os.path.join(strata, "strata-%s-abliterated.json" % tier_l if abl else "strata-%s.json" % tier_l)
 stock_pack = os.path.join(data_dir, "packs", tier_l)
+
+# spec §14: the KV rate, the parked-snapshot range, the parks-per-session count and the CPU encode
+# curve were all measured on qwen-family GSQ-RCO IQ3_S at 262144 with --kv int8. lib owns the
+# sentence and the test for which tiers need it; this file appends it wherever it prints one of
+# those figures, which is every place below that says "measured". The rate's own wording is in
+# lib/recommend._forced_reason, where the ladder that used the rate is described.
+carry = recommend.carry_over_note(tier)
 
 print("tier")
 col("choice", "%s  %s%s" % (tier, "(uncensored)" if abl else "(censored)",
@@ -496,15 +429,53 @@ print()
 # --------------------------------------------------------- the disk, before anything is fetched
 free_mib = free_override or detect.disk_free_mib(data_dir)
 free_gb = free_mib * MIB / GB
-need_gb = chosen["extra_disk_gb"]
+
+installed = os.path.isfile(os.path.join(strata, "serve", "server.py"))
+upstream_here = os.path.isfile(os.path.join(upstream, "setup.sh"))
+
+
+def find_stock_copy(root, name):
+    """Bytes of .gguf already under <root>/models/<name>, the directory this tool treats as the
+    stock (censored) tier's home.
+
+    --apply's stage 1 runs upstream's installer whenever Strata is not already installed, and on
+    the uncensored path that installer still downloads the STOCK build — the engine comes from it,
+    and its shards are the copy fetch-abliterated.sh hard-links shard 2 from (the stage list below
+    says the same). Whether those bytes are already on disk is a filesystem fact, so it is
+    measured here and the arithmetic that turns it into a figure stays in lib/recommend.
+    disk_preflight().
+
+    Summed by size rather than matched by name on purpose: this catalog pins the abliterated
+    filenames (catalog.shard_plan) and no stock ones, so a name test would be a guess. Like the
+    shared-shard-2 scan above, it errs toward asking for the bytes again — a partial download
+    counts as absent, which over-reserves rather than under-reserves.
+    """
+    total = 0
+    for dirpath, _dirs, files in os.walk(os.path.join(root, "models", name)):
+        for fname in files:
+            if not fname.endswith(".gguf"):
+                continue
+            try:
+                total += os.path.getsize(os.path.join(dirpath, fname))
+            except OSError:
+                continue
+    return total
+
+
+# Stage 1 puts the stock tier on disk only if it runs at all: not installed, and an installer to
+# run. With no setup.sh here --apply stops at the install stage before a byte is fetched, so the
+# stock bytes are not asked for either — and the disk section says so rather than going quiet.
+stage_one_downloads = bool(abl and not installed and upstream_here)
+stock_copy_held = find_stock_copy(data_dir, tier) >= recommend.stock_download_bytes(tier)
+disk = recommend.disk_preflight(box, tier, stage_one_downloads=stage_one_downloads,
+                                stock_copy_held=stock_copy_held)
+need_gb = disk["need_gb"]
 
 print("target")
 col("data dir", data_dir)
-installed = os.path.isfile(os.path.join(strata, "serve", "server.py"))
 col("strata", "%s  (%s)" % (strata, "installed" if installed else "not installed"))
 if not installed:
-    col("upstream", "%s  (%s)" % (upstream, "found" if os.path.isfile(os.path.join(upstream, "setup.sh"))
-                                  else "no setup.sh here"))
+    col("upstream", "%s  (%s)" % (upstream, "found" if upstream_here else "no setup.sh here"))
 col("config", "%s  (%s)" % (config,
                             "exists, left alone" if os.path.isfile(config) else
                             ("would write" if abl else "upstream's installer writes it")))
@@ -532,18 +503,46 @@ else:
             print(wrap("no copy under %s/models, so the full total is asked for. fetch-abliterated.sh "
                        "will stop rather than download it if nothing can supply it — fetching the "
                        "stock tier first, or passing --link-shard2, is your call." % data_dir))
+    # Which stage-1 case this is, said out loud: the figure is the same size either way only by
+    # coincidence, and a reader comparing this plan with upstream's later check has to be able to
+    # tell which downloads were already on disk.
+    if disk["stage_one_stock"]:
+        col("plus stage 1", "%.1f GB of the stock %s shards, less the %.1f GB shard 2 they share "
+                            "with this tier" % (disk["stock_gb"], tier, ple_bytes / GB))
+        print(wrap("counted because Strata is not installed at %s, so --apply's stage 1 runs %s's "
+                   "setup.sh, and that installer downloads the censored build even on the "
+                   "uncensored path: the engine comes from it, and its shards are the copy "
+                   "fetch-abliterated.sh hard-links shard 2 from. The preflight used to leave this "
+                   "out and say ok at %.1f GB, leaving %.1f GB for upstream's own free-disk check "
+                   "(setup.py:6418-6420) to discover."
+                   % (strata, upstream, need_gb - disk["stock_gb"], disk["stock_gb"])))
+    elif abl and stock_copy_held:
+        print(wrap("stage 1's stock shards are NOT counted: %s already holds them, so upstream's "
+                   "installer finds them there instead of fetching them."
+                   % os.path.join(data_dir, "models", tier)))
+    elif abl and installed:
+        print(wrap("stage 1's stock shards are NOT counted: Strata is already installed at %s, so "
+                   "--apply skips the install stage and nothing here fetches the censored build."
+                   % strata))
+    elif abl:
+        print(wrap("stage 1's stock shards are NOT counted because there is no setup.sh at %s: "
+                   "--apply stops at the install stage before anything is fetched. Point --upstream "
+                   "at an upstream checkout and this figure grows by %.1f GB."
+                   % (upstream, round((recommend.stock_download_bytes(tier) - ple_bytes) / GB, 1))))
     if chosen["low_ram"]:
-        col("plus arena", "%s GB the low-RAM mode writes (setup.py:6418-6420)" % (row["arena_gb"] + 1))
+        col("plus arena", "%.1f GB the low-RAM mode writes (setup.py:6418-6420)" % disk["arena_gb"])
     if need_gb > free_gb:
         col("verdict", "REFUSED")
         print()
         print("stop")
         print(wrap("not enough disk to fetch this: %.1f GB has to be free in %s and this filesystem "
                    "has %.1f GB free. The figure is the real size of the shards "
-                   "(lib/catalog.download_bytes), not upstream's published download_gb%s."
+                   "(lib/catalog.download_bytes)%s%s, not upstream's published download_gb."
                    % (need_gb, data_dir, free_gb,
-                      ", plus the %s GB expert arena the low-RAM mode writes" % (row["arena_gb"] + 1)
-                      if chosen["low_ram"] else "")))
+                      ", plus the %.1f GB expert arena the low-RAM mode writes" % disk["arena_gb"]
+                      if chosen["low_ram"] else "",
+                      ", plus the %.1f GB of stock shards stage 1 fetches" % disk["stock_gb"]
+                      if disk["stage_one_stock"] else "")))
         print(wrap("Free the disk, or point --dir at a filesystem that can hold it. Nothing was "
                    "downloaded and nothing was written."))
         sys.exit(1)
@@ -551,55 +550,40 @@ else:
 print()
 
 # ------------------------------------------------- the phase-one sizing (spec §9, two phases)
-snapshot_mib = recommend.estimate_snapshot_mib(chosen["context"], kv=chosen["kv"])
-snapshot_src = ("estimate: lib/recommend.estimate_snapshot_mib(%d tokens, --kv %s)"
-                % (chosen["context"], chosen["kv"]))
-if snapshot_mib <= 0:
-    snapshot_mib = recommend.FALLBACK_SNAPSHOT_MIB
+# The snapshot figure and the budget that follows from it are lib's, including the parks-per-
+# session count and the RAM reserve the budget is capped by: recommend.phase_one_budget() is the
+# same arithmetic apply-concurrency-fix.sh:241-255 does, and this file used to keep a third copy
+# of it. What stays here is only the labelling spec §9 asks for.
+snapshot_est = recommend.estimate_snapshot_mib(chosen["context"], kv=chosen["kv"])
+sized = recommend.phase_one_budget(box["ram_mib"], sessions, snapshot_est)
+snapshot_mib, budget_mib, slots = sized["snapshot_mib"], sized["budget_mib"], sized["slots"]
+capped, reserve_mib, allowance_mib = sized["capped"], sized["reserve_mib"], sized["allowance_mib"]
+if sized["fallback"]:
     snapshot_src = ("fallback: lib/recommend.FALLBACK_SNAPSHOT_MIB (%d MiB) — no context to size "
                     "from" % snapshot_mib)
-
-# The budget shape mirrors apply-concurrency-fix.sh:241-255 (need = sessions x parks x snapshot,
-# capped by MemTotal less a reserve, rounded up to a whole GiB). lib/recommend exposes the slot
-# arithmetic but no budget function, and lib/ is not this task's to edit, so the mirror is here.
-reserve_mib = max(6400, int(box["ram_mib"] * 0.11))
-allowance_mib = max(0, box["ram_mib"] - reserve_mib)
-
-
-def sized(snapshot):
-    need_mib = sessions * PER_SESSION_PARKS * snapshot
-    budget = ((min(need_mib, allowance_mib) + 1023) // 1024) * 1024
-    try:
-        return budget, recommend.slots_for_budget(budget, snapshot)
-    except ValueError:
-        # slots_for_budget refuses a 0 snapshot rather than counting slots against nothing.
-        fallback = recommend.FALLBACK_SNAPSHOT_MIB
-        need_mib = sessions * PER_SESSION_PARKS * fallback
-        budget = ((min(need_mib, allowance_mib) + 1023) // 1024) * 1024
-        return budget, recommend.slots_for_budget(budget, fallback)
-
-
-budget_mib, slots = sized(snapshot_mib)
-capped = sessions * PER_SESSION_PARKS * snapshot_mib > allowance_mib
+else:
+    snapshot_src = ("estimate: lib/recommend.estimate_snapshot_mib(%d tokens, --kv %s)"
+                    % (chosen["context"], chosen["kv"]))
 
 print("sizing  (phase one: an estimate, with an expiry)")
 col("sessions", sessions)
-col("snapshot", "%d MiB (%s)   <- %s" % (snapshot_mib, gib(snapshot_mib), snapshot_src))
-col("budget", "%d MiB (%.1f GiB)   <- %d sessions x %d parked each%s"
-    % (budget_mib, budget_mib / 1024, sessions, PER_SESSION_PARKS,
+col("snapshot", "%d MiB (%s)   <- %s%s" % (snapshot_mib, gib(snapshot_mib), snapshot_src, carry))
+col("budget", "%d MiB (%.1f GiB)   <- %d sessions x %d parked each%s%s"
+    % (budget_mib, budget_mib / 1024, sessions, recommend.PER_SESSION_PARKS,
        ", capped by the %s RAM allowance (MemTotal less the %d MiB reserve)"
-       % (gib(allowance_mib), reserve_mib) if capped else ""))
+       % (gib(allowance_mib), reserve_mib) if capped else "", carry))
 col("slots", "%d   <- budget / snapshot, rounded up" % slots)
-col("one source", "lib/recommend.estimate_snapshot_mib")
+col("one source", "lib/recommend.estimate_snapshot_mib + lib/recommend.phase_one_budget")
 print(wrap("apply-concurrency-fix.sh keeps its own KV table: it has no k8v4 key (so it defaults "
            "to 1.0 there) and uses 0.5 for q4_0 where lib/recommend uses 576/1056. On those two "
            "formats its figure is not this one; on int8 the two agree. This plan prints one "
            "figure and names its source rather than putting both on the screen."))
 print(wrap("This is a reading of a running engine, not a property of the model, and it expires. "
            "The same box measured 1.86 GiB at 15:00 and 2.22 GiB at 21:00 on 2026-10-17, and "
-           "1.43 GiB on 2026-10-18. Once the engine has parked something, re-run "
+           "1.43 GiB on 2026-10-18%s. Once the engine has parked something, re-run "
            "apply-concurrency-fix.sh: its /metrics path replaces this estimate with a measurement "
-           "of your own engine, which may come back larger or smaller than the number above."))
+           "of your own engine, which may come back larger or smaller than the number above."
+           % carry))
 print()
 
 # ------------------------------------------------------------------ the router, reported only
@@ -628,7 +612,7 @@ else:
         col("mmproj", "%s  %s bytes" % (catalog.MMPROJ["file"], catalog.MMPROJ["bytes"]))
         if vision_mode == "cpu":
             col("max_tokens", "1024")
-            col("encode cost", "measured on this box, 8 threads:")
+            col("encode cost", "measured on this box, 8 threads:%s" % carry)
             for tokens, seconds in ((300, "1.29 s"), (768, "5.9 s"), (972, "8.7 s"),
                                     (2028, "31.8 s"), (4015, "148 s")):
                 col("", "%5d image tokens -> %s" % (tokens, seconds))

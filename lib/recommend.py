@@ -185,7 +185,38 @@ MEASURED_FAMILY = ("qwen",)
 NOT_MEASURED = (" (that rate is measured on qwen-family GSQ-RCO IQ3_S at 262144, not measured on "
                 "this tier)")
 
+# The same warning for a carried-over figure that is not a rate. spec §14 lists four measured
+# figures — the KV rate, the 1.86 GiB average snapshot, "three parked conversations per session"
+# and the CPU encode curve — and says the tool prints "not measured on this tier" beside any of
+# them it carries onto another tier. :data:`NOT_MEASURED` says "that rate", which reads wrong
+# beside a count of parked conversations or a table of encode seconds, so the general wording
+# lives here rather than the rate's being stretched over three different kinds of figure.
+NOT_MEASURED_FIGURE = (" (carried over: measured on qwen-family GSQ-RCO IQ3_S at 262144 with "
+                       "--kv int8, not measured on this tier)")
+
 GB = 1e9
+
+
+def carry_over_note(name: str) -> str:
+    """spec §14's caveat to print beside a figure carried onto tier ``name`` — ``""`` inside
+    :data:`MEASURED_FAMILY`, so a caller appends it unconditionally and the qwen tiers stay clean.
+
+    The caller does not have to know which family a tier is in to be honest about it, which is the
+    whole reason this is a function and not a constant: an orchestrator that prints the KV rate,
+    the parks count and the encode curve has three chances to remember the caveat and no way to
+    check it got them all. Returns :data:`NOT_MEASURED_FIGURE`; where the figure *is* a rate,
+    :func:`carry_over_rate_note` gives the rate's wording.
+    """
+    return "" if catalog.TIERS[name]["family"] in MEASURED_FAMILY else NOT_MEASURED_FIGURE
+
+
+def carry_over_rate_note(name: str) -> str:
+    """:func:`carry_over_note` for the 17,406 B/token rate itself, in :data:`NOT_MEASURED`'s words.
+
+    Same test, different sentence: "that rate" is the right referent for a bytes-per-token figure
+    and the wrong one for a snapshot size or a curve of encode seconds.
+    """
+    return "" if catalog.TIERS[name]["family"] in MEASURED_FAMILY else NOT_MEASURED
 
 
 def _ram_gib(mib: int) -> float:
@@ -596,6 +627,175 @@ def recommend(box: dict, sessions: int = 4, want_abliterated: bool = True) -> di
     return best
 
 
+# --------------------------------------------------- the two answers a caller asks for by name
+#
+# ``recommend()`` answers "what should this box run". A setup tool also gets asked "then put THIS
+# tier on it" (--tier), and "how much disk do I need before I start". Both used to be rebuilt
+# inside bootstrap.sh out of this file's public constants, because the functions that do the work
+# were private; that mirror drifted silently the moment _kv_plan or _disk_gb changed shape, and
+# the tests pinned the numbers this box produced rather than the library's identity. These two are
+# the public entry points the plan's architecture asks for — "Python carries the numbers because
+# that is where they can be unit-tested without a GPU" — and they call the same private helpers
+# ``recommend()`` does, so a forced tier and a recommended one cannot disagree.
+
+
+def stock_download_bytes(name: str) -> int:
+    """Bytes upstream's installer puts on disk for the **stock** (censored) build of ``name``.
+
+    On the four abliterated tiers the row's ``download_gb`` is exactly that figure: setup.py
+    quotes ISTA's censored file there (see lib/catalog's two-download-figures note), while
+    ``download_bytes()`` returns SC117's larger re-quantization. So the stock download and the
+    abliterated download are two different files, both landing in the target directory, and a
+    preflight that counts only one of them under-reserves.
+
+    The shared shard 2 is NOT subtracted here — that is the caller's arithmetic to make once, in
+    :func:`disk_preflight`, because whether it is saved depends on which copy is already on disk.
+    """
+    return round(catalog.TIERS[name]["download_gb"] * GB)
+
+
+def disk_preflight(box: dict, name: str, *, stage_one_downloads: bool = False,
+                   stock_copy_held: bool = False) -> dict:
+    """The disk figure the preflight refuses on, split into the parts the plan prints.
+
+    ``stage_one_downloads`` says ``--apply``'s stage 1 will run upstream's installer, which is the
+    only thing that puts the **stock** tier on disk. On the uncensored path that stage still runs
+    (the engine comes from upstream, and its stock shards are where the hard-linkable shard 2
+    comes from — bootstrap.sh says so in its own stage list), so the stock tier's bytes belong in
+    the figure. Counting only the abliterated download let a fresh box be told ``ok`` at 135.2 GB
+    for IQ3_S and then need 54.8 GB more, with the failure landing late inside upstream's own
+    free-disk check (setup.py:6418).
+
+    ``stock_copy_held`` says the stock tier's shards are already in the target directory, in which
+    case upstream's installer finds them and downloads nothing.
+
+    What is added is the stock tier's **non-shared** bytes (``stock_download_bytes`` less the
+    28.8 GB shard 2), because the stock download is itself the copy the abliterated fetcher
+    hard-links from: on a fresh box the two shard 2s are one file, so charging both would ask for
+    28.8 GB that never appears. The residual this leaves, stated rather than hidden: a box that
+    already holds an *abliterated* shard 2 but no stock copy gets the link saving and still pays
+    for a second, stock-shaped shard 2, so the figure sits 28.8 GB under the truth there. That
+    state — an abliterated tier fetched, Strata never installed — is rare, and the direction is
+    the same under-reserve the preflight already errs toward for anything this catalog cannot
+    size; ``need_gb`` is a floor, not a guarantee.
+
+    ``need_gb`` is ``tier_gb + stock_gb``, one decimal, and ``None`` whenever ``tier_gb`` is (no
+    honest download figure for the tier, so no honest total either). The other keys are what the
+    plan prints beside it: ``low_ram``, the arena the mode writes (0.0 when it does not apply),
+    ``shared_shard2_held``, and ``stage_one_stock`` — whether the stock line was added at all,
+    which is how the disk section says which case it printed.
+    """
+    tier = catalog.TIERS[name]
+    ram = _ram_gib(box.get("ram_mib", 0))
+    low_ram = _low_ram_applies(ram, tier)
+    held = bool(box.get("has_shared_shard2"))
+    tier_gb = _disk_gb(name, low_ram, held)
+    stock_gb = 0.0
+    added = stage_one_downloads and not stock_copy_held and tier["abliterated"]
+    if added:
+        stock_gb = round((stock_download_bytes(name) - catalog.shared_shard2()[0]) / GB, 1)
+    return {"need_gb": None if tier_gb is None else round(tier_gb + stock_gb, 1),
+            "tier_gb": tier_gb, "stock_gb": stock_gb, "low_ram": low_ram,
+            "arena_gb": round(tier["arena_gb"] + 1, 1) if low_ram else 0.0,
+            "shared_shard2_held": held, "stage_one_stock": added}
+
+
+def _forced_reason(box: dict, name: str, context: int, kv: str, low_ram: bool,
+                   fits_in_ram: bool) -> str:
+    """The verdict ``--tier`` gets, in upstream's three-state voice (setup.py:6092, :6111).
+
+    Two things this has to get right, both of which an earlier version of the orchestrator got
+    wrong in its own copy of this prose:
+
+    spec §14. The context and KV format below the verdict come off the ladder built on the
+    measured 17,406 B/token rate, so outside :data:`MEASURED_FAMILY` the sentence naming them
+    carries :func:`carry_over_rate_note`.
+
+    The low-RAM sentence is gated on ``low_ram``, not on ``fits_in_ram``. They are different
+    tests: ``low_ram_fits`` (setup.py:4039-4042) asks whether the card's VRAM closes a RAM
+    shortfall, and ``low_ram_needed`` (:4011-4014) asks whether the installer would actually put
+    the tier in the mode — and Unsloth's ``budget: True`` rows are exempt from the second
+    (:4051), reading part of their experts from the GGUF through ``--resident-budget-gib``
+    whatever the RAM is. Gating on ``fits_in_ram`` printed "upstream's installer will put it in
+    the low-RAM mode" beside a disk figure that had no arena in it, because
+    :func:`_low_ram_applies` had correctly left the arena out.
+    """
+    tier = catalog.TIERS[name]
+    ram, vram = _ram_gib(box.get("ram_mib", 0)), _vram_gib(box.get("vram_mib", 0))
+    parts = [f"{name}: chosen with --tier, not recommended by this box. This box reports "
+             f"{ram:.1f} GiB of RAM and {vram:.1f} GiB of VRAM."]
+    if ram >= tier["ram_gb"]:
+        parts.append(f"It clears its published floor of {tier['ram_gb']} GiB.")
+    elif ram >= tier["ram_gb"] - TIGHT_BAND_GB:
+        parts.append(f"it sits {tier['ram_gb'] - ram:.1f} GiB under the {tier['ram_gb']} GiB floor, "
+                     f"inside the {TIGHT_BAND_GB} GiB band upstream's own verdict calls \"tight\" "
+                     f"rather than \"does not fit\" (setup.py:6092).")
+    elif fits_in_ram and low_ram:
+        parts.append(f"it sits {tier['ram_gb'] - ram:.1f} GiB under the {tier['ram_gb']} GiB floor, "
+                     "past the tight band, but upstream's low-RAM-mode test (setup.py:4039-4042) "
+                     "still passes here: the card holds what it can of the "
+                     f"{tier['arena_gb']} GB expert arena and the rest is read from the SSD, so "
+                     "upstream's installer will put it in the low-RAM mode. That is \"not at a "
+                     "published floor\", not \"this machine cannot run the model\".")
+    elif fits_in_ram:
+        parts.append(f"it sits {tier['ram_gb'] - ram:.1f} GiB under the {tier['ram_gb']} GiB floor, "
+                     "past the tight band, and upstream's low-RAM-mode test (setup.py:4039-4042) "
+                     f"still passes here on the card's {vram:.1f} GiB — but this tier's family is "
+                     "exempt from the mode itself (setup.py:4051, ``budget: True``): it reads part "
+                     "of its experts from the GGUF through --resident-budget-gib whatever the RAM "
+                     "is, so no expert arena is written and the disk figure below is the download "
+                     "alone. That is \"not at a published floor\", not \"this machine cannot run "
+                     "the model\".")
+    if tier["abliterated"]:
+        parts.append("This is the uncensored build.")
+    else:
+        parts.append(f"This is the censored model: the uncensored builds exist at "
+                     f"{', '.join(catalog.abliterated_tiers())} only.")
+    parts.append(f"The context and KV format below are this tool's ladder against this tier's "
+                 f"{tier['arena_gb']} GB expert arena: {context} tokens at --kv {kv} is the longest "
+                 f"rung whose KV cache fits beside the share of the arena this tool keeps room "
+                 f"for, at the measured {KV_BYTES_PER_TOKEN_INT8:,} bytes/token"
+                 f"{carry_over_rate_note(name)}.")
+    if low_ram:
+        parts.append(f"The low-RAM mode applies here (setup.py:4011-4014), so the "
+                     f"{tier['arena_gb'] + 1:.1f} GB expert arena is part of the disk figure.")
+    return " ".join(parts)
+
+
+def forced_plan(box: dict, name: str, sessions: int = 4, want_abliterated: bool = True) -> dict:
+    """The plan for a tier the user named but :func:`recommend` did not offer.
+
+    Same shape as :func:`recommend`'s answer — the keys Task 7 prints, with ``alternatives`` empty
+    — plus ``forced`` (so the printer can say which it is), ``fits_in_ram`` (upstream's permissive
+    verdict, which decides whether the "does not fit" paragraph goes on) and ``ram_gib`` (the
+    figure that paragraph quotes back). ``context``, ``kv``, ``low_ram``, ``extra_disk_gb``,
+    ``ceiling`` and ``relief`` come from the same private helpers :func:`recommend` uses, which is
+    the point: a tier reached by ``--tier`` and the same tier reached as a recommendation cannot
+    report two different disk figures for one box.
+
+    ``extra_disk_gb`` is the tier's own figure only — the download, the arena when the mode
+    applies, less the shared shard 2 when the box holds one. The stock tier's bytes that
+    ``--apply``'s stage 1 adds are not in it, because whether they land is a fact about the
+    install, not about the tier; :func:`disk_preflight` is what folds them in.
+
+    Raises ``KeyError`` for a tier this catalog does not list — the caller checks the name against
+    :func:`lib.catalog.tiers_for` first, and a name that got past that is a bug, not a stop.
+    """
+    tier = catalog.TIERS[name]
+    ram = _ram_gib(box.get("ram_mib", 0))
+    vram = _vram_gib(box.get("vram_mib", 0))
+    context, kv, _meets_share, _runs_on_card = _kv_plan(vram, tier)
+    low_ram = _low_ram_applies(ram, tier)
+    fits_in_ram, _needs_mode = fits(box, tier)
+    return {"tier": name, "abliterated": tier["abliterated"],
+            "reason": _forced_reason(box, name, context, kv, low_ram, fits_in_ram),
+            "context": context, "kv": kv, "low_ram": low_ram,
+            "extra_disk_gb": _disk_gb(name, low_ram, bool(box.get("has_shared_shard2"))),
+            "ceiling": _ceiling(box.get("os") or "linux", ram, tier, context, kv)[0],
+            "relief": _ceiling(box.get("os") or "linux", ram, tier, context, kv)[1],
+            "alternatives": [], "forced": True, "fits_in_ram": fits_in_ram, "ram_gib": ram}
+
+
 # ------------------------------------------------------- first-run sizing (spec §9, phase one)
 #
 # Two phases, in code. Phase one — these three functions — sizes a box that has never parked a
@@ -768,3 +968,62 @@ def slots_for_budget(budget_mib: int, snapshot_mib: int) -> int:
                          "known — size it with estimate_snapshot_mib() (or the engine's own "
                          "measurement) before counting slots")
     return max(1, -(-budget_mib // snapshot_mib))
+
+
+# ------------------------------------------------------------------ the budget the flags carry
+#
+# ``slots_for_budget`` answers "how many slots does a budget hold". It does not answer "what
+# budget should this box get", which is the question a setup tool has to answer before the config
+# exists at all. apply-concurrency-fix.sh:241-255 does, and bootstrap.sh reproduced it line for
+# line — a copy that drifted silently the moment the script's shape changed, which is the drift
+# the plan's "numbers live in lib/" rule exists to prevent. These are the two measured constants
+# that copy was holding, named here so the entry point can print them without owning them.
+
+# One live session parks MORE than one conversation over time: four sessions produced 99 parks
+# against 12 resident slots on the reference box (apply-concurrency-fix.sh:236-241, which keeps
+# the same 3 as its default at :241). Sizing the budget as sessions x ONE snapshot under-provisions
+# it badly — that is what made an earlier revision of that script shrink a box that was already
+# evicting. spec §14 lists "three parked conversations per session" among the figures measured on
+# qwen-family GSQ-RCO IQ3_S at 262144, so a caller printing it for another tier carries
+# :func:`carry_over_note` beside it.
+PER_SESSION_PARKS = 3
+
+# apply-concurrency-fix.sh:253-254: the RAM the script leaves out of the budget's way — the guard
+# floor plus a working margin, never less than 6,400 MiB and never less than 11 % of MemTotal.
+# Both figures are the script's, read off its lines rather than reinvented here.
+RAM_RESERVE_FLOOR_MIB = 6_400
+RAM_RESERVE_SHARE = 0.11
+
+
+def phase_one_budget(ram_mib: int, sessions: int, snapshot_mib: int) -> dict:
+    """``{budget_mib, slots, capped, reserve_mib, allowance_mib, snapshot_mib, fallback}``.
+
+    The budget phase one writes into a fresh config: ``sessions x PER_SESSION_PARKS x
+    snapshot_mib``, capped by what the RAM can actually back, rounded up to a whole GiB, with the
+    slot count that agrees with it. Reproduces apply-concurrency-fix.sh:241-255 and :266 — the
+    ``max(6400, 11 %)`` reserve at :253, the cap at :254-255, the whole-GiB round-up at :266 — and
+    takes the slot count from :func:`slots_for_budget`, which is already pinned to the script's
+    ``ceil`` at :272.
+
+    A ``snapshot_mib`` of 0 means no size is known, and :func:`slots_for_budget` refuses it rather
+    than counting slots against nothing. That is the documented zero of
+    :func:`estimate_snapshot_mib` arriving here, so the figure is replaced with
+    :data:`FALLBACK_SNAPSHOT_MIB` — the script's own last resort at :208 — and ``fallback`` says
+    so, because a caller that labelled the number an estimate has to keep labelling it one when it
+    becomes the fallback instead. The substitution happens here rather than in the caller so the
+    budget and the slot count can never be sized from two different snapshots.
+
+    ``capped`` is why the plan says "capped by the RAM allowance" instead of printing a budget the
+    sessions asked for: the need is above the allowance, so the box gets less than it wanted.
+    """
+    snapshot = snapshot_mib
+    fallback = False
+    if snapshot <= 0:
+        snapshot, fallback = FALLBACK_SNAPSHOT_MIB, True
+    reserve_mib = max(RAM_RESERVE_FLOOR_MIB, int(ram_mib * RAM_RESERVE_SHARE))
+    allowance_mib = max(0, ram_mib - reserve_mib)
+    need_mib = sessions * PER_SESSION_PARKS * snapshot
+    budget_mib = ((min(need_mib, allowance_mib) + 1023) // 1024) * 1024
+    return {"budget_mib": budget_mib, "slots": slots_for_budget(budget_mib, snapshot),
+            "capped": need_mib > allowance_mib, "reserve_mib": reserve_mib,
+            "allowance_mib": allowance_mib, "snapshot_mib": snapshot, "fallback": fallback}

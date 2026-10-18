@@ -16,9 +16,14 @@ Why the fixtures look the way they do, in the order measurements on this box for
   ``shutil.disk_usage`` on the tightest real filesystem instead. Fixed shared target names were
   measured to be unsafe: a mutation run that makes ``--dry-run`` write left ``~/strata-dry-target``
   behind, and the next run failed its own "the target does not exist yet" precondition.
-* **Nothing touches 8080, 8090 or 18080** — all three are live here. The router probe is aimed at
-  a listener the test opens itself, or at 127.0.0.1:1, which answers ECONNREFUSED on this box.
-  The apply tests run apply-concurrency-fix.sh against a config on port 18099, also refused.
+* **Nothing touches 8080, 8090 or 18080** — all three are live here (measured 2026-10-18: a
+  connect to each succeeds, 8090 being the llama-swap router this box runs). The router probe is
+  aimed at a listener the test opens itself, or at 127.0.0.1:1, which answers ECONNREFUSED here.
+  That is enforced by construction, not by every call site remembering: ``run_script`` appends
+  ``--router-port 1`` to any invocation that did not name one, because an earlier revision of this
+  module claimed the same thing while ``plan()`` never passed the flag and every plan test probed
+  the live router on 8090. ``test_no_plan_run_probes_a_dead_router_port`` is the pin. The apply
+  tests run apply-concurrency-fix.sh against a config on port 18099, also refused.
 * **No test downloads.** The apply path runs against stub fetch-abliterated.sh and
   prepare-abliterated-pack.sh in a scratch repo copy; the config writer and apply-concurrency-fix.sh
   are the real ones.
@@ -36,6 +41,10 @@ from lib import catalog
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "bootstrap.sh")
+
+# A port nothing listens on, so the plan's router probe answers ECONNREFUSED instead of finding
+# this box's live llama-swap. run_script() appends it whenever a test did not name its own port.
+DEAD_ROUTER_PORT = "1"
 
 # Every stubbed run finishes in seconds; a real fetch is a 55 GB download and a real pack is two
 # passes over it. A lost stub therefore fails with a message instead of hanging.
@@ -117,13 +126,17 @@ class TestSetup(unittest.TestCase):
 
     # --------------------------------------------------------------------------- fixtures
 
-    def stub_strata(self, installed=False):
+    def stub_strata(self, installed=False, name="strata"):
         """A Strata home whose .venv/bin/python answers the §13 probe and then runs python3.
 
         ``installed=True`` also drops serve/server.py in place, which is how bootstrap.sh decides
         the install stage is already satisfied.
+
+        ``name`` picks the directory because plan()'s default home is an installed one and it is
+        built before an explicit ``strata=`` argument is evaluated: a not-installed stub that
+        reused the same path would inherit serve/server.py and read as installed.
         """
-        home = os.path.join(self.tmp, "strata")
+        home = os.path.join(self.tmp, name)
         bindir = os.path.join(home, ".venv", "bin")
         os.makedirs(bindir, exist_ok=True)     # a test may ask for the same home twice
         stub = os.path.join(bindir, "python")
@@ -161,13 +174,22 @@ class TestSetup(unittest.TestCase):
         return repo
 
     def run_script(self, *args, **kw):
-        """Run the entry point. ``shell=`` picks the interpreter, ``script=`` a scratch copy."""
+        """Run the entry point. ``shell=`` picks the interpreter, ``script=`` a scratch copy.
+
+        Every run gets ``--router-port`` unless it named one, so no test can reach this box's live
+        llama-swap on 8090 by forgetting the flag: the plan's router probe is a side effect of
+        printing the plan, and a probe of a live port makes "nothing listening" assertions depend
+        on what the box happens to be running.
+        """
         shell = kw.pop("shell", "sh")
         script = kw.pop("script", SCRIPT)
         timeout = kw.pop("timeout", SCRIPT_TIMEOUT_SECONDS)
         env = dict(os.environ)
         env.update(kw.pop("env", {}))
-        argv = [shell, script] + list(args)
+        args = list(args)
+        if "--router-port" not in args:
+            args += ["--router-port", DEAD_ROUTER_PORT]
+        argv = [shell, script] + args
         try:
             return subprocess.run(argv, capture_output=True, text=True, env=env, timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -186,6 +208,16 @@ class TestSetup(unittest.TestCase):
         r = self.run_script(*(extra + list(args)), **kw)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         return r
+
+    def stub_upstream(self):
+        """A directory holding a setup.sh, which is all bootstrap.sh checks before it will claim
+        stage 1 can run. Never executed by a plan run; the apply tests stop at the install stage."""
+        upstream = os.path.join(self.tmp, "upstream")
+        os.makedirs(upstream)
+        with open(os.path.join(upstream, "setup.sh"), "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(os.path.join(upstream, "setup.sh"), 0o755)
+        return upstream
 
     def read_log(self, path):
         if not os.path.exists(path):
@@ -269,8 +301,22 @@ class TestSetup(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         out = r.stdout + r.stderr
         self.assertIn("python3-venv", out)
-        self.assertNotIn("sudo will ask", r.stdout)
         self.assertIn("Nothing was written", out)
+        # spec §13: the one step that can need a password is said plainly and stopped at. The
+        # assertion here used to be assertNotIn("sudo will ask", r.stdout) — that string is
+        # upstream's message and never this script's, so it could not fail whatever the script
+        # did. What can fail is the shape of the remedy: it names the exact command, it says this
+        # tool will not run it, and every sudo in the entry point is an echo rather than a command
+        # the script executes.
+        folded = " ".join(out.split())
+        self.assertIn("sudo apt-get install -y python3 python3-venv python3-pip", folded)
+        self.assertIn("will not run it for you", folded)
+        with open(SCRIPT, encoding="utf-8") as fh:
+            shell_lines = shell_only(fh.read()).splitlines()
+        for line in shell_lines:
+            if "sudo" in line and not line.strip().startswith("#"):
+                self.assertTrue(line.strip().startswith("echo"),
+                                "sudo is executed rather than printed: %r" % line)
 
     def test_the_python_stop_never_prints_the_linux_remedy_on_darwin(self):
         """§13's stop routes on the OS: apt/dnf does not exist on a Mac, and upstream's Mac fix
@@ -282,6 +328,10 @@ class TestSetup(unittest.TestCase):
         out = r.stdout + r.stderr
         for linux_only in ("python3-venv", "apt-get", "dnf"):
             self.assertNotIn(linux_only, out)
+        # No sudo anywhere in the Mac remedy: the whole point of that branch is that upstream
+        # resolves the missing interpreter without a password. An earlier assertion here checked a
+        # string the script never prints, so it passed whatever this branch said.
+        self.assertNotIn("sudo", out)
         self.assertIn("standalone CPython", out)
         self.assertIn("setup.sh:36-46", out)
 
@@ -393,6 +443,147 @@ class TestSetup(unittest.TestCase):
         # Port 1 answers ECONNREFUSED here; 8080/8090/18080 are live and none is probed.
         r = self.plan("--router-port", "1")
         self.assertIn("nothing listening on 127.0.0.1:1", r.stdout)
+
+    def test_no_plan_run_probes_a_dead_router_port(self):
+        """The hermeticity claim used to be false: plan() never passed --router-port, so every
+        plan test probed this box's live llama-swap on 8090 and reported it as a router."""
+        r = self.plan()
+        self.assertIn("nothing listening on 127.0.0.1:%s" % DEAD_ROUTER_PORT, r.stdout)
+        for live in ("8080", "8090", "18080"):
+            self.assertNotIn("127.0.0.1:%s" % live, r.stdout,
+                             "the plan probed a port that is live on this box")
+        # The pin only means something while the script's own default is one of those ports: if
+        # the default moved off 8090 the helper's injection would stop being load-bearing, and the
+        # assertion above would pass for the wrong reason.
+        self.assertIn("which port to probe for a router (default 8090)",
+                      self.run_script("--help").stdout)
+
+    # ------------------------------------------- spec §14: carried-over figures say they are one
+
+    def test_a_carried_over_figure_says_it_was_not_measured_on_the_tier(self):
+        """§14 obliges the caveat beside every measured figure the tool carries onto another tier.
+        The orchestrator prints four of them — the KV rate behind the snapshot estimate, the
+        parks-per-session count, the dated parked-snapshot readings and the CPU encode curve — and
+        an Unsloth tier has to be told none of them were measured on it."""
+        r = self.plan("--tier", "UD-Q6_K_XL")
+        folded = " ".join(r.stdout.split())
+        self.assertIn("not measured on this tier", folded)
+        # Each of the four, not one caveat for the whole screen.
+        self.assertIn("estimate: lib/recommend.estimate_snapshot_mib(131072 tokens, --kv int8) "
+                      "(carried over", folded)
+        self.assertIn("4 sessions x 3 parked each (carried over", folded)
+        self.assertIn("1.43 GiB on 2026-10-18 (carried over", folded)
+        self.assertIn("measured on this box, 8 threads: (carried over", folded)
+
+    def test_the_measured_family_carries_no_carry_over_caveat(self):
+        # The other half: on the family the figures WERE measured on, the caveat must be absent,
+        # or it stops being a warning and becomes noise nobody reads.
+        r = self.plan("--tier", "IQ3_S")
+        self.assertNotIn("not measured on this tier", r.stdout)
+
+    def test_a_forced_tier_outside_the_measured_family_says_so_in_its_own_reason(self):
+        # The forced-tier reason is lib's prose now, and it names the rate the ladder is built on.
+        r = self.plan("--tier", "UD-Q6_K_XL")
+        folded = " ".join(r.stdout.split())
+        self.assertIn("at the measured 17,406 bytes/token (that rate is measured on qwen-family "
+                      "GSQ-RCO IQ3_S at 262144, not measured on this tier)", folded)
+
+    def test_a_forced_unsloth_tier_does_not_claim_a_mode_its_family_is_exempt_from(self):
+        """The prose used to contradict its own arithmetic: the low-RAM sentence was gated on
+        fits_in_ram, while the disk figure was gated on low_ram, and Unsloth's budget: True rows
+        answer those two tests differently (setup.py:4039-4042 vs :4051). One screen then said the
+        mode runs and asked for no arena."""
+        r = self.plan("--tier", "UD-Q6_K_XL")
+        folded = " ".join(r.stdout.split())
+        self.assertIn("exempt from the mode itself", folded)
+        self.assertNotIn("upstream's installer will put it in the low-RAM mode", folded)
+        self.assertNotIn("low-RAM mode:", folded)
+        self.assertNotIn("plus arena", folded)
+        # And the figure really is the download alone, which is what the new sentence claims.
+        needs = float(re.search(r"^needs +([\d.]+) GB", r.stdout, re.M).group(1))
+        self.assertAlmostEqual(needs, catalog.download_bytes("UD-Q6_K_XL") / 1e9, places=1)
+
+    def test_a_tier_the_mode_really_applies_to_still_prints_the_arena(self):
+        # Re-gating must not silence the mode where it runs: IQ3_S on this box is under arena_gb +
+        # 10 (setup.py:4011-4014), so the sentence and the arena line both stay.
+        r = self.plan("--tier", "IQ3_S")
+        self.assertIn("low-RAM mode:", r.stdout)
+        self.assertIn("plus arena", r.stdout)
+
+    # ------------------------------- the disk preflight, including what stage 1 of --apply fetches
+
+    def test_a_fresh_box_is_asked_for_the_stock_shards_stage_one_fetches(self):
+        """The uncensored path still runs upstream's setup.sh (stage 1), and that installer
+        downloads the censored build: the engine comes from it, and its shards are the copy
+        fetch-abliterated.sh hard-links shard 2 from. Counting only the abliterated download told
+        a fresh box ok at 135.2 GB and left ~55 GB for upstream's own check to discover."""
+        upstream = self.stub_upstream()
+        fresh = self.plan("--tier", "IQ3_S", "--strata",
+                          self.stub_strata(installed=False, name="strata-fresh"),
+                          "--upstream", upstream)
+        installed = self.plan("--tier", "IQ3_S")          # plan()'s default home is installed
+        fresh_needs = float(re.search(r"^needs +([\d.]+) GB", fresh.stdout, re.M).group(1))
+        installed_needs = float(re.search(r"^needs +([\d.]+) GB", installed.stdout, re.M).group(1))
+        stock_non_shared = (round(catalog.TIERS["IQ3_S"]["download_gb"] * 1e9)
+                            - catalog.shared_shard2()[0]) / 1e9
+        self.assertAlmostEqual(fresh_needs - installed_needs, stock_non_shared, places=1)
+        self.assertIn("plus stage 1", fresh.stdout)
+
+    def test_the_disk_section_says_which_stage_one_case_it_printed(self):
+        """The figure is the same size in either case only by coincidence, so the section has to
+        name the case rather than leave a reader to infer it from a number."""
+        upstream = self.stub_upstream()
+        fresh = self.plan("--tier", "IQ3_S", "--strata",
+                          self.stub_strata(installed=False, name="strata-fresh"),
+                          "--upstream", upstream)
+        self.assertIn("counted because Strata is not installed", " ".join(fresh.stdout.split()))
+
+        quiet = self.plan("--tier", "IQ3_S")
+        self.assertIn("stage 1's stock shards are NOT counted: Strata is already installed",
+                      " ".join(quiet.stdout.split()))
+        self.assertNotIn("plus stage 1", quiet.stdout)
+
+    def test_a_stock_copy_already_on_disk_is_not_asked_for_again(self):
+        target = os.path.join(self.tmp, "stock-held")
+        stock_dir = os.path.join(target, "models", "IQ3_S")
+        os.makedirs(stock_dir)
+        with open(os.path.join(stock_dir, "stock-shard-00001-of-00002.gguf"), "wb") as fh:
+            fh.truncate(round(catalog.TIERS["IQ3_S"]["download_gb"] * 1e9))   # sparse
+        r = self.plan("--dir", target, "--tier", "IQ3_S", "--strata",
+                      self.stub_strata(installed=False, name="strata-fresh"),
+                      "--upstream", self.stub_upstream())
+        self.assertIn("already holds them", " ".join(r.stdout.split()))
+        self.assertNotIn("plus stage 1", r.stdout)
+
+    def test_no_installer_means_no_stock_bytes_and_says_why(self):
+        # --apply stops at the install stage when there is no setup.sh, so nothing fetches the
+        # stock shards either — and the plan says so instead of going quiet on a smaller number.
+        empty = os.path.join(self.tmp, "no-upstream")
+        os.makedirs(empty)
+        r = self.plan("--tier", "IQ3_S", "--strata",
+                      self.stub_strata(installed=False, name="strata-fresh"),
+                      "--upstream", empty)
+        self.assertNotIn("plus stage 1", r.stdout)
+        self.assertIn("no setup.sh at", " ".join(r.stdout.split()))
+
+    # ------------------------------------------- the entry point owns no arithmetic, no constant
+
+    def test_the_entry_point_owns_no_measured_constant_and_no_sizing_arithmetic(self):
+        """The header's claim, checked rather than asserted. bootstrap.sh used to carry
+        PER_SESSION_PARKS = 3 — a §14-listed measured constant with its provenance in a comment —
+        while claiming above it that the file owns no measured figure, and to rebuild the forced
+        tier's KV ladder, disk total and budget from lib's constants. All three are lib's now."""
+        with open(SCRIPT, encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertNotIn("PER_SESSION_PARKS = ", src,
+                         "the measured parks count is back in the entry point")
+        self.assertNotIn("0.11", src, "the RAM reserve share is back in the entry point")
+        for entry in ("recommend.forced_plan(", "recommend.phase_one_budget(",
+                      "recommend.disk_preflight(", "recommend.carry_over_note("):
+            self.assertIn(entry, src, "%s is not called from the entry point" % entry)
+        # The header states what the file still owns instead of claiming it owns nothing.
+        self.assertIn("owns no sizing arithmetic and no", src)
+        self.assertIn("two measured READINGS", src)
 
     # ------------------------------------------------------------------------ the shell itself
 
