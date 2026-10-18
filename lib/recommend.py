@@ -66,6 +66,12 @@ Every number here names its source:
                                           own per-cell bytes — 1056 for int8, 816 for k8v4, 576
                                           for q4_0 (setup.py:198 and its ``--kv`` help), which is
                                           the check spec §9 names
+    110,000 expected conversation tokens  THIS TOOL'S OWN assumption, not a measurement —
+                                          ``ESTIMATED_CONVERSATION_TOKENS``: the length a fresh
+                                          install's conversations reach. It is NOT the length the
+                                          reference box's 1.86–2.22 GiB snapshots came from —
+                                          110,000 tokens is 1.78 GiB at the measured rate, under
+                                          that range's low end (see :func:`estimate_snapshot_mib`)
     ``--kv`` choices                      setup.py:5722
     ~5 GB of VRAM for the dense weights,
     buffers and a short context           setup.py:4017-4023 (``low_ram_gpu_gb``)
@@ -109,8 +115,9 @@ Every number here names its source:
 
 ``sessions`` sizes the conversation cache, which is the RAM ceiling's subject; the per-session
 snapshot cost is measured against a running engine (``estimate_snapshot_mib`` /
-``slots_for_budget``, added next), so here it appears in the ceiling's text rather than in the
-tier choice — RAM caps how many sessions stay warm, it does not change which tier is resident.
+``snapshot_from_metrics`` / ``slots_for_budget``, below), so here it appears in the ceiling's text
+rather than in the tier choice — RAM caps how many sessions stay warm, it does not change which
+tier is resident.
 
 ``box["has_shared_shard2"]`` (optional, falsy by default) says the target directory already holds
 the 28.8 GB shard 2 that every abliterated tier shares (``catalog.shared_shard2()``); the disk
@@ -587,3 +594,141 @@ def recommend(box: dict, sessions: int = 4, want_abliterated: bool = True) -> di
     best, alternatives = plans[0], plans[1:]
     best["alternatives"] = alternatives
     return best
+
+
+# ------------------------------------------------------- first-run sizing (spec §9, phase one)
+#
+# Two phases, in code. Phase one — these three functions — sizes a box that has never parked a
+# conversation from the measured per-token rate applied to an *expected conversation length*, and
+# labels the result an estimate. Phase two is ``apply-concurrency-fix.sh`` re-run once the engine
+# has parked something: its live-``/metrics`` path replaces the estimate with a measurement, and
+# spec §9 is explicit that the tool has to tell the user to expect that second pass rather than
+# pretend the first one is final. Task 7 prints what these return.
+#
+# Two of them reproduce arithmetic that already ships, and the tests in tests/test_sizing.py check
+# them against the script's own text: Task 7 prints one source or the other, so a reader comparing
+# two answers about one engine must not see two numbers, or two names for the same number.
+
+# One MiB, spelled out because the script spells it the same way (apply-concurrency-fix.sh:191
+# :206) and the two files have to land on the same integer, including where they truncate.
+MIB = 1_048_576
+
+# What a conversation is expected to reach, in tokens, on a box with no history. This tool's own
+# assumption, not a measurement: at the measured rate it is 1.78 GiB, *under* the 1.86-2.22 GiB the
+# reference box measured — see :func:`estimate_snapshot_mib` for the arithmetic and for why the
+# direction is right for a fresh install and wrong for a box that has been running all day.
+ESTIMATED_CONVERSATION_TOKENS = 110_000
+
+# The script's label, verbatim (apply-concurrency-fix.sh:210), for the same reason its division is
+# verbatim: one engine, one name for what it measured. The other two are prefixed ``estimate:`` so
+# a printed line can never be read as a measurement (Review Focus 5).
+MEASURED_SNAPSHOT = "measured from /metrics"
+NO_PARK_SNAPSHOT = "estimate: engine has parked nothing yet"
+NO_BYTES_SNAPSHOT = "estimate: engine reports no snapshot bytes yet"
+
+
+def estimate_snapshot_mib(context: int, expected_tokens: int | None = None,
+                          kv: str = "int8") -> int:
+    """MiB one parked snapshot costs at ``context``, sized from an expected conversation length.
+
+    Why not ``context`` itself. 17,406 B/token x 262144 is 4,351 MiB = 4.25 GiB, against the
+    1.86 GiB the reference box actually parked (spec §9) — sizing from the window is ~2.3x
+    pessimistic, and on a 60 GB box that is "budget exhausted at four slots" instead of "four
+    sessions fit". So the multiply is by an expected conversation length, :data:`
+    ESTIMATED_CONVERSATION_TOKENS` unless the caller passes one, capped at ``context`` because a
+    conversation cannot outlive the window it was generated in: a 32,768-token box sized from
+    110,000 tokens would be over-provisioned 3.4x, the same class of error in the other direction.
+
+    What 110,000 is, and what it is not. It is what a **fresh** install's conversations look like
+    before they mature. It is NOT the length the reference box's 1.86-2.22 GiB snapshots came from,
+    which is how an earlier draft of this function described it: at 17,406 B/token 110,000 tokens
+    is 1,825 MiB = 1.78 GiB, below the 1.86 GiB low end of that range, and inverting the range gives
+    ~114,740 tokens (1.86 GiB) and ~136,947 tokens (2.22 GiB) — so the constant sits under the
+    whole measured range. The measured figures came from a box that had been running since the
+    morning (1.86 GiB at 15:00, 2.22 GiB at 21:00, spec §9), and a first-run estimate is sizing the
+    morning, not the evening: below the low end is the honest direction for a box with no history,
+    on the understanding that the phase-two reading comes back larger. A box that has already been
+    in use a while is under-provisioned by this figure from day one, which is why the tool sends
+    the user to phase two instead of treating this as final. tests/test_sizing.py pins the
+    relationship (1,825 MiB, under 1,904 MiB) so the claim cannot rot into a false one.
+
+    ``kv`` scales the rate by the engine's own per-cell bytes (:data:`KV_CELL_BYTES`), the check
+    spec §9 names. **Known divergence, deliberately not unified:** for ``k8v4`` this gives
+    816/1056 = 0.77 of the int8 rate — 1,410 MiB at 110,000 tokens — while
+    ``apply-concurrency-fix.sh:188-190`` has no ``k8v4`` key, so there the format falls through to
+    ``KV_FACTOR``'s 1.0 default and reports 1,825 MiB for the same engine and the same config.
+    Reviewer and Task 7: one config, two snapshot sizes, on ``k8v4`` only. Only
+    :data:`KV_FORMATS` are accepted here; the script's wider table (q8_0, int4, q4_k, f16, bf16,
+    f32) raises ``KeyError`` rather than quietly taking that 1.0 default.
+
+    Spec §14: the rate is measured on qwen-family GSQ-RCO IQ3_S at 262144 with ``--kv int8``. The
+    return is a bare int, so the labelling duty is the caller's — outside the qwen family print
+    :data:`NOT_MEASURED` beside it, and never print this as a measurement of the caller's box.
+    Truncates toward zero like the script's ``int(...)`` at :191, so the two never differ by a
+    rounding step. Returns 0 when ``context`` is 0 — the script's own ``if max_context else 0`` at
+    :191, meaning "no context configured, nothing to size", not "free".
+    """
+    tokens = ESTIMATED_CONVERSATION_TOKENS if expected_tokens is None else expected_tokens
+    tokens = min(tokens, context)
+    if tokens <= 0:
+        return 0
+    return int(tokens * _kv_bytes_per_token(kv) // MIB)
+
+
+def snapshot_from_metrics(parked: int, total_bytes: int) -> tuple[int, str]:
+    """``(mib, source_label)`` — the engine's own average parked snapshot, or a labelled zero.
+
+    Reproduces ``apply-concurrency-fix.sh:206`` exactly — ``int(c["bytes"] / c["parked"] /
+    1048576)``, truncating rather than rounding — and returns the script's label string verbatim
+    (:210), because Task 7 prints one source or the other and a reader comparing two answers about
+    one engine must not see two numbers, or two names for the same number.
+
+    The label is the point of the return shape. ``"measured from /metrics"`` is a reading of the
+    caller's own engine, so spec §14's carry-over warning does not apply to it and it says nothing
+    about the tier — it is not a carried-over figure. Anything else returned is an estimate and is
+    labelled ``"estimate: ..."`` so a caller can never mistake it for a measurement.
+
+    **The zero is not a size, and the caller has to know it.** ``(0, "estimate: ...")`` comes back
+    when the engine has parked nothing yet, or has parked something but reports no bytes — the same
+    two tests the script's own guard makes at :205 (``if c.get("parked") and c.get("bytes")``). The
+    script then treats a zero as "fall through to the next source" (``want_snap or
+    measured_snap_mib or theoretical_snap_mib or 2560``, :208) and never sizes from it, so a 0 here
+    means **"no measurement exists — do not size from this"**, and the caller must substitute
+    :func:`estimate_snapshot_mib` (or the script's own 2,560 MiB fallback) before computing a
+    budget or a slot count. Task 7 leans on this contract, and :func:`slots_for_budget` refuses a 0
+    so the substitution cannot be skipped by accident.
+    """
+    if parked <= 0:
+        return 0, NO_PARK_SNAPSHOT
+    if total_bytes <= 0:
+        return 0, NO_BYTES_SNAPSHOT
+    return int(total_bytes / parked / MIB), MEASURED_SNAPSHOT
+
+
+def slots_for_budget(budget_mib: int, snapshot_mib: int) -> int:
+    """How many slots a ``budget_mib`` budget holds at ``snapshot_mib`` each — ``ceil``, so the
+    budget and the slot count agree by construction.
+
+    The question this answers is "how many conversations can this budget warm". It is **not** the
+    script's budget computation: ``apply-concurrency-fix.sh:241-243`` sets ``per_session = 3``
+    parked conversations per live session, observed on the reference box, and :251 turns it into the
+    budget the other way round — ``need_mib = sessions * per_session * snapshot_mib`` — with no
+    slot count anywhere in it. Folding that 3 in here would answer the script's question instead of
+    this one (and report 5 slots where 14 fit), so this function takes two arguments and multiplies
+    by nothing.
+
+    Rounds up, matching the script at :269-272 (``max(1, -(-budget_mib // snapshot_mib))``): a
+    floor leaves ``budget_mib - slots * snapshot_mib`` as budget that can never park anything, the
+    dead capacity the script's own comment calls out. At 30,720 MiB and 2,272 MiB that is 14 slots,
+    not 13 — 13 leave 1,184 MiB idle. The ``max(1, ...)`` floor is the script's too: a budget under
+    one snapshot still gets one slot.
+
+    ``snapshot_mib`` 0 raises instead of answering. 0 is what :func:`snapshot_from_metrics` returns
+    when no measurement exists, and dividing by it would print a slot count with no size behind it
+    — the guess spec §12 forbids. Substitute :func:`estimate_snapshot_mib` first.
+    """
+    if snapshot_mib <= 0:
+        raise ValueError("slots_for_budget: snapshot_mib is 0, which means no snapshot size is "
+                         "known — size it with estimate_snapshot_mib() (or the engine's own "
+                         "measurement) before counting slots")
+    return max(1, -(-budget_mib // snapshot_mib))
