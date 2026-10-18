@@ -245,7 +245,7 @@ that parking was unaffordable when it was not.
 |---|---|
 | `apply-concurrency-fix.sh` | detect hardware, size and apply the flags |
 | `park-watch.sh` | the monitor |
-| `fetch-abliterated-iq3s.sh` | download + verify the model |
+| `fetch-abliterated.sh` | download + verify the model |
 | `prepare-abliterated-pack.sh` | build the Strata pack it requires |
 | `reference/strata-iq3_s-abliterated.json` | the shipping config |
 | `TUNING.md` | the full diagnosis, root cause and measurements |

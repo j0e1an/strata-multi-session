@@ -44,6 +44,56 @@ class TestCatalog(unittest.TestCase):
         self.assertEqual(catalog.download_bytes("IQ1_M"), 58_400_000_000)
         self.assertEqual(catalog.download_bytes("NVFP4"), 128_000_000_000)
 
+    def test_abliterated_rows_name_the_files_on_the_hub(self):
+        # Names read from the Hub tree API for SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF
+        # on 2026-10-18, where every size and oid alongside them matched this table. IQ3_S's two
+        # are the names fetch-abliterated.sh has always hardcoded.
+        expected = {
+            "Q2_0": ["Qwen3.8-Flash-Next-GSQ-RCO-abliterated-Q2_0-00001-of-00002.gguf",
+                     "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-Q2_0-00002-of-00002.gguf"],
+            "IQ2_XS": ["Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ2_XS-00001-of-00002.gguf",
+                       "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ2_XS-00002-of-00002.gguf"],
+            "IQ3_XXS": ["Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-00001-of-00002.gguf",
+                        "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-00002-of-00002.gguf"],
+            "IQ3_S": ["Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf",
+                      "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00002-of-00002.gguf"],
+        }
+        self.assertEqual(sorted(expected), sorted(catalog.abliterated_tiers()))
+        for tier, files in expected.items():
+            self.assertEqual(catalog.TIERS[tier]["shard_files"], files, tier)
+            self.assertEqual(len(files), catalog.TIERS[tier]["shards"], tier)
+
+    def test_shard_plan_is_its_own_row_and_nothing_else(self):
+        for tier in catalog.abliterated_tiers():
+            row = catalog.TIERS[tier]
+            plan = catalog.shard_plan(tier)
+            self.assertEqual(len(plan), row["shards"], tier)
+            for i, shard in enumerate(plan):
+                self.assertEqual(set(shard), {"file", "bytes", "oid", "url"}, tier)
+                self.assertEqual(shard["file"], row["shard_files"][i], tier)
+                self.assertEqual(shard["bytes"], row["shard_bytes"][i], tier)
+                self.assertEqual(shard["oid"], row["shard_oids"][i], tier)
+                self.assertIn("/%s/" % tier, shard["url"], tier)
+
+    def test_shard_plan_keeps_shard2_shared_across_the_four_tiers(self):
+        nbytes, oid = catalog.shared_shard2()
+        for tier in catalog.abliterated_tiers():
+            shared = [s for s in catalog.shard_plan(tier) if s["oid"] == oid]
+            self.assertEqual(len(shared), 1, tier)
+            self.assertEqual(shared[0]["bytes"], nbytes, tier)
+
+    def test_shard_plan_url_is_the_resolve_url_the_fetcher_has_always_used(self):
+        self.assertEqual(
+            catalog.shard_plan("IQ3_S")[0]["url"],
+            "https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF"
+            "/resolve/main/IQ3_S/"
+            "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf")
+
+    def test_shard_plan_refuses_tiers_it_cannot_fetch(self):
+        self.assertRaises(ValueError, catalog.shard_plan, "NO-SUCH-TIER")
+        # A censored tier has no abliterated filenames to name, so a plan would be a guess.
+        self.assertRaises(ValueError, catalog.shard_plan, "Q8_0")
+
     def test_download_bytes_refuses_to_guess(self):
         self.assertIsNone(catalog.download_bytes("NO-SUCH-TIER"))
         # An abliterated tier with no pinned shards has only the censored figure on hand. Saying

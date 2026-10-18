@@ -8,6 +8,13 @@ source, named beside the row it came from:
   shard_bytes / shard_oids, abliterated tiers        the Hub's LFS pointers, re-read from the
                                                      tree API for SC117/Qwen3.8-Flash-Next-GSQ-
                                                      RCO-abliterated-GGUF on 2026-10-17 (spec §16)
+  shard_files, abliterated tiers                     the same tree API, re-read 2026-10-18: the
+                                                     eight names under ``<TIER>/`` there, each one
+                                                     confirmed against the size and oid already
+                                                     pinned in its own row. IQ3_S's two are the
+                                                     names fetch-abliterated.sh always hardcoded
+  ABLITERATED_REPO                                   the single repo those eight files live in,
+                                                     also read off the old fetch script
   shard_bytes / shard_oids, Unsloth tiers            setup.py:312 / :323 / :333 (UNSLOTH_SHARDS,
                                                      UNSLOTH_IQ4_XS_SHARDS, UNSLOTH_BIG_SHARDS)
   MAC_TIERS                                          metal/setup_mac.py:45 (``MAC_MODELS``); the
@@ -49,9 +56,15 @@ CONTEXTS = [8192, 32768, 65536, 131072, 204800, 262144, 393216, 524288]
 
 # Shard 2 of all four abliterated tiers is the same file: the n-gram/PLE table, which does not depend
 # on the expert quantization (spec §16). Upstream's own IQ3_S shard 2 carries the identical oid, which
-# is why fetch-abliterated-iq3s.sh hard-links it rather than downloading it — 28 GB saved per tier.
+# is why fetch-abliterated.sh hard-links it rather than downloading it — 28 GB saved per tier.
 PLE_BYTES = 28_800_138_432
 PLE_OID = "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"
+
+# Where the eight abliterated shard files live. One repo and one URL base, not one per row: the four
+# tiers differ only in the ``<TIER>/`` folder and the tier inside the file name, so repeating the repo
+# four times would be four chances to mistype it. ``shard_plan()`` builds the download URLs from these.
+ABLITERATED_REPO = "SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF"
+HF_RESOLVE_BASE = "https://huggingface.co"
 
 # What the tool offers on Linux (and Windows, which goes through the same setup.py). Sizes are
 # upstream's own: download_gb is the download, ram_gb is the RAM that keeps every expert resident,
@@ -62,24 +75,32 @@ TIERS = {
     "Q2_0": {
         "family": "qwen", "download_gb": 66.4, "ram_gb": 48, "arena_gb": 34.0, "abliterated": True,
         "shards": 2,
+        "shard_files": ["Qwen3.8-Flash-Next-GSQ-RCO-abliterated-Q2_0-00001-of-00002.gguf",
+                        "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-Q2_0-00002-of-00002.gguf"],
         "shard_bytes": [38_021_379_872, PLE_BYTES],
         "shard_oids": ["1620faf21c845524cbe38dcbbaf850b8d155c2299df05d8b7bfb43b642c4647e", PLE_OID],
     },
     "IQ2_XS": {
         "family": "qwen", "download_gb": 68.0, "ram_gb": 48, "arena_gb": 35.5, "abliterated": True,
         "shards": 2,
+        "shard_files": ["Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ2_XS-00001-of-00002.gguf",
+                        "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ2_XS-00002-of-00002.gguf"],
         "shard_bytes": [39_665_015_072, PLE_BYTES],
         "shard_oids": ["4acc3ebb5050d20117bdc77fc39200e709dfe2b2367f3522c95b9112a30aff81", PLE_OID],
     },
     "IQ3_XXS": {
         "family": "qwen", "download_gb": 75.8, "ram_gb": 60, "arena_gb": 42.9, "abliterated": True,
         "shards": 2,
+        "shard_files": ["Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-00001-of-00002.gguf",
+                        "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-00002-of-00002.gguf"],
         "shard_bytes": [47_342_144_896, PLE_BYTES],
         "shard_oids": ["03b11926b41a3d7f7a008882b1bc7a6330a3c9c43d3cad4598d31dc73042fdc5", PLE_OID],
     },
     "IQ3_S": {
         "family": "qwen", "download_gb": 83.6, "ram_gb": 62, "arena_gb": 50.3, "abliterated": True,
         "shards": 2,
+        "shard_files": ["Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf",
+                        "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00002-of-00002.gguf"],
         "shard_bytes": [55_063_448_064, PLE_BYTES],
         "shard_oids": ["40f369eca301ec6ea318dbb671b3132c26a2f0b89aa5458a7051b33215ee296c", PLE_OID],
     },
@@ -206,6 +227,35 @@ def shared_shard2() -> tuple[int, str]:
     (spec §16).
     """
     return (PLE_BYTES, PLE_OID)
+
+
+def shard_plan(tier: str) -> list[dict]:
+    """Every file ``fetch-abliterated.sh`` needs for ``tier``: name, bytes, LFS oid, URL.
+
+    The fetcher stays thin because the plan is assembled here: the shell asks for this and does
+    nothing but download, link and verify what it is handed. Nothing is fetched to build it — the
+    names, sizes and oids are the ones pinned in the row, so the plan is the same with the network
+    down as with it up (``--refresh`` is what re-reads the Hub, and it is the fetcher's choice).
+
+    The shard whose oid equals ``shared_shard2()[1]`` is the one the fetcher hard-links instead of
+    downloading; callers identify it by that oid rather than by its position, since the identity
+    that makes it linkable is that it is the same bytes everywhere.
+
+    ``ValueError`` rather than an empty plan when there is nothing honest to return: a tier this
+    catalog does not list, and a tier with no abliterated filenames — every censored tier, which
+    this fetcher never handles and whose names here would be a guess.
+    """
+    if tier not in TIERS:
+        raise ValueError("no such tier: %s" % tier)
+    row = TIERS[tier]
+    files = row.get("shard_files")
+    if not files:
+        raise ValueError("tier %s has no abliterated shard filenames in this catalog" % tier)
+    return [
+        {"file": name, "bytes": row["shard_bytes"][i], "oid": row["shard_oids"][i],
+         "url": "%s/%s/resolve/main/%s/%s" % (HF_RESOLVE_BASE, ABLITERATED_REPO, tier, name)}
+        for i, name in enumerate(files)
+    ]
 
 
 def download_bytes(tier: str) -> int | None:
