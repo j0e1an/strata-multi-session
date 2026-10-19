@@ -228,3 +228,62 @@ ordinary prompt processing." The **parking** path honours that - it logs
 `skip parking (...)` and serves the request normally. The **`--prompt-cache` checkpoint** path
 printed no guard or skip line in either crash and died instead. Strata 0.1.44.1. The server
 itself asks for a report at github.com/Niko1221/Strata/issues.
+
+## 11. Four sessions at 250k context - measured on the 2x5090 box, 2026-10-19
+
+Goal: 4 concurrent sessions, each at 200 tok/s and 200k+ context. The context half is met; the
+speed half is not reachable on this engine.
+
+### Speed: a shared ceiling, not a per-session rate (2x5090, 2026-10-19, short prompts)
+
+| setup (`--batch 4`) | 1 session | 2 | 3 | 4 (each / total) |
+|---|---|---|---|---|
+| `--batch-groups 2`, no `--batch-mtp` (shipped) | 251-280 | 134 each | ~100 each | **84-96 / ~335-385** |
+| `--batch-groups 1 --batch-mtp` | 272-277 | 136 each | 96 each | 75 / 300 |
+| `--batch-groups 4` (`--batch-mtp` is switched off by the engine) | 270 | 131 each | - | 67 / 268 |
+
+Total throughput barely grows with sessions: two sessions together equal one. The engine log
+(`strata batch:`) shows why - `avg 7.30 rows, 24.41 ms/window`. A batch window holds at most 8
+rows (docs/BATCHING.md), and window time barely grows with rows (about 16 ms solo, 22 ms for 7
+rows), so four sessions each get about 2 rows per window instead of the ~4.4 tokens a lone
+session verifies. There is no flag for the 8-row limit. vLLM does not escape it for this model:
+Flash-Next is 125B total / 6B active with a 51B embedding table that must sit in host RAM, the
+FP8 checkpoint is 172 GB, QSA attention rejects an FP8 KV cache, and the published RTX PRO 6000
+numbers are 74 tok/s solo, 142 with MTP, 484 at 32 clients - below what Strata already does here.
+
+### Context: 4 x 253k holds, with every session in a slot (2x5090, 2026-10-19)
+
+`bench/stress_append.py 55000 5 2500 4`: four append-only conversations grown from ~214k to ~253k
+tokens, 5 turns. **0 crash signatures**; after the cold read each turn read ~9.7k new tokens and
+reused the rest, a whole round taking 14-16 s (one session re-read once on the last turn, 36 s).
+Cold prefill of all four took 90 s. Host MemAvailable minimum 10.2 GiB, engine RSS 24.8-43.8 GiB.
+Per-slot cost is small: 0.62 GiB VRAM and 1.2 GiB pinned RAM at the full 262144 context.
+
+### Beyond four sessions: safe, but not fast (2x5090, 2026-10-19)
+
+Six sessions of 175k-224k tokens on four slots: **0 crash signatures** in two runs, but roughly half
+the turns re-read ~200k tokens (40-100 s each) because the round-robin over 6 conversations and 4
+slots defeats LRU. Parked snapshots are ~3.0-3.8 GiB at these sizes. Why restores miss when
+parked < budget is not diagnosed.
+
+### Mistakes made while measuring - do not repeat
+
+- **A test that rewrites the prompt tail shows `reused=0` forever.** Recurrent (GDN) state cannot
+  roll back, so only append-only prompts reuse. Use `bench/stress_append.py`.
+- **`--memory-limit-mib` can be the binding cap even when RAM is free.** At 50000 the guard showed
+  `source flag` with ~3.5 GiB available while the host had ~17 GiB free, and evicted 30 snapshots.
+  57344 with `--conversation-cache-min-free-mib 4096` let the physical check bind instead.
+- **`/tmp` is a RAM-backed tmpfs here.** Three stale `strata-fetch-*` directories held 22 GiB of
+  host RAM for a day, and `MemAvailable` looked 15 GiB worse than the engine deserved. Check
+  `df /tmp` before sizing the parking budget.
+- **A backup taken after an edit is not a backup.** One interrupted command edited the config before
+  it was rejected, so a file named `...-groups2` actually held `groups 1 + --batch-mtp`, and every
+  long-context run in the first pass used the slower variant. Confirm the engine's `engine started`
+  line, not the filename, before trusting a result.
+
+### Settings in `reference/strata-iq3_s-abliterated.json`
+
+`parallel 4`, `--batch-groups 2`, `--kv k8v4 --kv-resident 65536`, `--conversation-cache-mib 20480`,
+`--conversation-cache-slots 8`, `--memory-limit-mib 57344`, `--conversation-cache-min-free-mib 4096`.
+Soak time on these exact settings is about 40 minutes, not hours; section 9's 6.5 h figure was
+taken on the older 30720 MiB / 12 slot settings.
